@@ -22,6 +22,7 @@ Run with: pytest tests/ -v
 """
 import pathlib
 import re
+import types
 
 import jinja2
 import pytest
@@ -34,6 +35,8 @@ BLUEPRINT_PATH = (
     / "automation"
     / "cover_control_automation.yaml"
 )
+
+INVALID_STATES = ["", "unavailable", "unknown", "none", "None", "null", "query failed", []]
 
 VENT_FLOOR_ALIAS = "Shading start - hold ventilation floor (window tilted)"
 SHADING_FIRST_ALIAS = "Window tilted - Sun shading takes precedence"
@@ -98,6 +101,12 @@ def _find_variable_definition(node, name: str):
 def _render(template: str, entity_states: dict, **variables) -> str:
     env = jinja2.Environment(undefined=jinja2.StrictUndefined)
     env.globals["states"] = lambda entity_id: entity_states.get(entity_id, "unknown")
+    # expand(): plain entity passes through as its own single-item state list -
+    # matches real HA for a non-group entity (group semantics are not exercised here).
+    env.globals["expand"] = lambda entity_id: (
+        [] if isinstance(entity_id, list)
+        else [types.SimpleNamespace(state=entity_states.get(entity_id, "unknown"))]
+    )
     env.filters["regex_search"] = lambda value, pattern: re.search(pattern, str(value)) is not None
     return env.from_string(template).render(**variables).strip()
 
@@ -118,6 +127,15 @@ class TestCascade:
             "binary_sensor.opened": "on" if opened else "off",
             "binary_sensor.tilted": "on" if tilted else "off",
         }
+        # tilted_invalid is a shared top-level blueprint variable that effective_state
+        # now references by name - render it first, like the blueprint's own
+        # evaluation order (always False here: no test in this file exercises an
+        # invalid tilted reading).
+        tilted_invalid = _render(
+            BP["variables"]["tilted_invalid"], entities,
+            contact_window_tilted="binary_sensor.tilted",
+            invalid_states=INVALID_STATES,
+        ) == "True"
         return _render(
             BP["variables"]["effective_state"], entities,
             helper_json=helper,
@@ -128,6 +146,9 @@ class TestCascade:
             is_ventilation_enabled=True,
             is_opening_scheduled=sched,
             shading_over_ventilation=option,
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=False,
+            tilted_invalid=tilted_invalid,
         )
 
     def test_default_keeps_the_ventilation_floor(self):

@@ -1510,7 +1510,7 @@ Three things happen, and it is worth keeping them apart — only the third one c
 |--------|-------------------------------|
 | **Cover** | CCA pauses. Without a position it cannot decide anything, and commands to an unreachable cover fail |
 | **Status helper** | CCA pauses (its stored state must not be overwritten). If the helper is *empty* rather than unavailable, CCA rewrites it with default values |
-| **Window contact** | The **last known** window state applies. CCA does not assume "closed" — that could lower the cover onto an open window. So while the window was last known **open or tilted**, CCA waits and the cover holds its position |
+| **Window contact** | The **last known** window state applies, never "closed" by default, since that could lower the cover onto an open window. While last known **open or tilted**, CCA waits and holds position. Otherwise it continues with "not open"/"still closed" (see below to disable that assumption) |
 | **Resident sensor** | The **last known** presence applies (not "nobody home") |
 | **Brightness, sun, weather, calendar, workday** | CCA keeps working. These only *influence* decisions — a flaky outdoor sensor must never stop your cover from closing in the evening. Sun shading simply does not start while its sensor is missing |
 
@@ -1550,6 +1550,8 @@ What "caught up" means:
 **One regular trigger is consumed after a restart or a save.** The recovery run claims the first trigger that fires within the next minute, so that CCA never acts on an outdated status. If a scheduled opening happens to fall into that minute, it is handled by the recovery (when it may catch up) or skipped (when it may not) — the next trigger runs normally again. The clean-up run itself waits until the cover and the other required sources are usable, so that minute starts when everything is back — a slow cover after a restart does not stretch the claim into the rest of the day.
 
 **When a battery sensor stays silent:** window and presence sensors only report when something changes. After a restart of your *hub* they can be without a state for hours. That is expected — CCA continues with the last known values. Only the one case above (window last known open/tilted) makes it wait, and that resolves the moment you next move the window.
+
+**Can I prevent CCA from lowering below ventilation position if the window contact state is unknown?** By default, an unreadable **tilted** contact reads as closed; an unreadable **opened** contact reads as not open. Both match the last known truth in most cases, but neither is confirmed. Enable **"Limit how far cover lowers when a contact sensor state is unreadable"** ([💨 Ventilation Configuration](handbook/contacts#auto_ventilate_options)) to change both: tilted then always resolves as tilted (cover never closes past the ventilation position); opened then withholds the close/shading instead, never driving the cover. The opened contact's proactive open-drive, its LOCKOUT role, and the "hold and wait" behavior above are unaffected, since assuming "open" there could be genuinely wrong. Off by default.
 
 ---
 

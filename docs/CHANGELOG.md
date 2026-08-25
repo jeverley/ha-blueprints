@@ -1,5 +1,11 @@
 **Note:** Previous changes are archived here: [CHANGELOG_OLD.md](https://hvorragend.github.io/ha-blueprints/CHANGELOG_OLD).
 
+# CCA 2026.08.14 V2
+
+- ✨ **Feature:** New opt-in Ventilation Configuration option **"💨 Limit how far cover lowers when a contact sensor state is unreadable"**. Previously, an unreadable **tilted** contact was read as closed or froze the run entirely, depending on the last known state; neither one actually says "we don't know." With the option on, an unreadable tilted contact always resolves as tilted, holding the cover at the ventilation floor instead of closing further. For the **opened** contact, it withholds a scheduled close or shading start/end instead of assuming "not open": it never drives the cover. The opened contact's proactive full-open movement and LOCKOUT role stay confirmed-only regardless of the toggle. Off by default for both
+
+---
+
 # CCA 2026.08.14
 
 - ✨ **Feature:** New sun-shading option **"Independent Shading: Keep shading active while the temperature threshold is exceeded"** ([#605](https://github.com/hvorragend/ha-blueprints/issues/605)). On hot days an active sun shading no longer ends during the day — e.g. when the sun leaves the configured azimuth range — as long as the forecasted temperature or (if enabled) *"Temperature Sensor 2"* stays above the *"Independent Temperature Threshold"* (with hysteresis, so the hold does not flap around the threshold). The cover then stays shaded until the normal closing time or the nightly reset. Requires *"Independent Shading via Temperature Comparison"*; on cooler days — and for everyone who does not enable the new option — the shading-end behavior is unchanged. Unlike the existing behavior option *"☀️ Stay shaded: Don't open cover when sun shading ends"*, which applies to **every** shading end, this hold is scoped to hot days detected by the independent temperature comparison — the normal shading still ends normally. Note: the shading-end triggers only fire when a condition *becomes* invalid, so if the temperature drops below the threshold later in the day, the shading usually still lasts until the next end trigger fires (or until the closing time) — which is exactly the requested "shade the whole day" behavior

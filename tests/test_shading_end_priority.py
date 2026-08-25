@@ -291,6 +291,8 @@ class TestShadingEndProspectiveCascade:
             "helper_state_force": "non",
             "is_ventilation_enabled": True,
             "window_opened_now": False,
+            "opened_invalid": False,
+            "limit_lowering_on_unknown_contact_state": False,
             "window_tilted_now": False,
             "state_resident": False,
             "resident_flags": {
@@ -492,3 +494,99 @@ class TestShadingEndProspectiveCascade:
         variables["ventilate_tilt_position"] = 60
         alias = _first_matching_alias(_env(entity_states), choose, variables)
         assert alias == "Ventilation after shading ends"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug fix: shading_end_state's 'lock' target was the only lockout-target
+# computation still reading window_opened_now instead of also treating an
+# unreadable contact as locked out (window_opened_now or (toggle and opened_invalid)).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestShadingEndStateOpenedLockoutToggle:
+    def test_confirmed_open_still_selects_lock(self):
+        assert TestShadingEndProspectiveCascade._render_state(
+            window_opened_now=True,
+        ) == "lock"
+
+    def test_toggle_off_unconfirmed_opened_does_not_lock(self):
+        assert TestShadingEndProspectiveCascade._render_state(
+            window_opened_now=False, opened_invalid=True,
+            limit_lowering_on_unknown_contact_state=False,
+        ) != "lock"
+
+    def test_unconfirmed_opened_with_toggle_on_selects_lock(self):
+        assert TestShadingEndProspectiveCascade._render_state(
+            window_opened_now=False, opened_invalid=True,
+            limit_lowering_on_unknown_contact_state=True,
+        ) == "lock"
+
+    def test_unconfirmed_opened_outranks_the_tilted_ventilation_floor(self):
+        assert TestShadingEndProspectiveCascade._render_state(
+            window_opened_now=False, opened_invalid=True,
+            limit_lowering_on_unknown_contact_state=True,
+            window_tilted_now=True,
+        ) == "lock"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug fix: shading_end_state == 'lock' reached via an unconfirmed opened reading
+# must never reach a real drive - unlike lockout_now.*, the "Move cover after
+# shading end" fallback builds a real drive_plan and bypasses manual override
+# for 'lock' (design-decisions.md).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestMoveCoverAfterShadingEndNeverDrivesOnUnconfirmedLock:
+    @staticmethod
+    def _will_drive(**over):
+        move = _find_branch_by_alias(
+            _load_blueprint_yaml(),
+            "Move cover after shading end - conditions still valid",
+        )
+        template = _find_variable(move, "will_drive")
+        variables = {
+            "shading_end_target_condition_ok": True,
+            "shading_end_opening_allows": True,
+            "shading_end_ventilation_allows": True,
+            "is_paused": False,
+            "shading_end_force_allows": True,
+            "shading_end_state": "lock",
+            "window_opened_now": True,
+            "manual_allows_event": {"shd": True},
+        }
+        variables.update(over)
+        return _env().from_string(template).render(**variables).strip() == "True"
+
+    def test_confirmed_open_lock_still_drives_and_still_bypasses_manual_override(self):
+        """Unchanged, intentional behaviour: a genuinely confirmed open window
+        proactively drives to the lockout position regardless of a recent manual
+        adjustment - this predates the toggle and must not be touched."""
+        assert self._will_drive(
+            window_opened_now=True, manual_allows_event={"shd": False},
+        ) is True
+
+    def test_unconfirmed_lock_never_drives_even_when_manual_would_allow_it(self):
+        """The bug: an unreadable opened contact (toggle on) resolving
+        shading_end_state to 'lock' must never reach a real drive here - not even
+        when manual_allows_event.shd is True, which the old code let bypass."""
+        assert self._will_drive(
+            window_opened_now=False, manual_allows_event={"shd": True},
+        ) is False
+
+    def test_unconfirmed_lock_stays_blocked_when_manual_also_refuses(self):
+        assert self._will_drive(
+            window_opened_now=False, manual_allows_event={"shd": False},
+        ) is False
+
+    def test_non_lock_states_are_unaffected_by_the_guard(self):
+        """The new guard term only ever applies to shading_end_state == 'lock' -
+        every other target keeps depending solely on manual_allows_event.shd."""
+        assert self._will_drive(
+            shading_end_state="vnt", window_opened_now=False,
+            manual_allows_event={"shd": True},
+        ) is True
+        assert self._will_drive(
+            shading_end_state="vnt", window_opened_now=False,
+            manual_allows_event={"shd": False},
+        ) is False

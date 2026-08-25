@@ -165,6 +165,8 @@ SCENARIO_DEFAULTS = dict(
     lockout_tilted_when_closing=False,
     lockout_tilted_when_shading_starts=False,
     lockout_tilted_when_shading_ends=False,
+    invalid_states=["", "unavailable", "unknown", "none", "None", "null", "query failed", []],
+    limit_lowering_on_unknown_contact_state=False,
     # helper state
     helper=dict(bas="opn", shd=0, pnd="non", win="cls", frc="non", res=0, man=0),
     helper_ts_open=0, helper_ts_close=0, helper_ts_man=0,
@@ -247,13 +249,20 @@ def _context(s: dict, trigger_id: str) -> tuple[dict, dict]:
     ctx["manual_allows_event"] = Runner(ctx, entities, {}).render(
         _top_var("manual_allows_event")
     )
-    for name in ("window_opened_now", "window_tilted_now", "window_any_now"):
+    # tilted_invalid/opened_invalid are shared top-level variables (effective_state,
+    # recovered_window, window_tilted_now, lockout_now and shading_end_state all
+    # reference them by name) - render them first, like the blueprint's own
+    # variables: evaluation order.
+    for name in ("tilted_invalid", "opened_invalid"):
+        ctx[name] = Runner(ctx, entities, {}).render(_top_var(name))
+    for name in ("window_opened_now", "window_tilted_confirmed", "window_tilted_now",
+                 "window_any_now"):
         ctx[name] = Runner(ctx, entities, {}).render(_action_var(name))
     for name in ("in_open_position", "in_close_position", "in_shading_position",
                  "in_ventilate_position", "in_lockout_position",
                  "position_comparisons", "resident_flags", "effective_state"):
         ctx[name] = Runner(ctx, entities, {}).render(_top_var(name))
-    for name in ("lockout_now", "environment_allows_opening",
+    for name in ("lockout_now", "win_on_lockout", "environment_allows_opening",
                  "environment_allows_closing", "base_gates",
                  "closing_position_hold", "state_targets", "state_gates"):
         ctx[name] = Runner(ctx, entities, {}).render(_action_var(name))

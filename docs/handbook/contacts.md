@@ -33,6 +33,8 @@ See also the [following posts](https://community.home-assistant.io/t/cover-contr
 
 <strong>If the sensor has no status</strong> — typical for a battery-powered contact after a restart of your hub, which only reports again when the window is next moved — the automation continues with the <ins>last known</ins> window status. It deliberately does not treat the window as closed, because that could lower the cover onto an open window. So while the last known status was <ins>open or tilted</ins>, the automation waits and the cover holds its position; everything resumes as soon as the sensor reports again.
 
+<strong>Separately</strong>, while last known <ins>closed or tilted</ins>, a currently unreadable opened contact is by default read as "not open" for a scheduled close or shading start/end, an assumption that usually matches the truth. See <ins>"Limit how far cover lowers when a contact sensor state is unreadable"</ins> under [💨 Ventilation Configuration](#auto_ventilate_options) below to disable that assumption too.
+
 ---
 
 <a id="contact_window_tilted"></a>
@@ -52,6 +54,8 @@ See also the [following posts](https://community.home-assistant.io/t/cover-contr
 <strong>Important note:</strong> Please do not enter the same sensor in both fields for the contact sensors. This does not work and leads to strange situations.
 
 <strong>If the sensor has no status</strong> — typical for a battery-powered contact after a restart of your hub, which only reports again when the window is next moved — the automation continues with the <ins>last known</ins> window status. It deliberately does not treat the window as closed, because that could lower the cover onto an open window. So while the last known status was <ins>open or tilted</ins>, the automation waits and the cover holds its position; everything resumes as soon as the sensor reports again.
+
+<strong>If the last known status was closed</strong>, an unreadable tilt sensor is by default read as "still closed" and the cover shades/closes normally, an assumption that usually matches the truth. See <ins>"Limit how far cover lowers when a contact sensor state is unreadable"</ins> under [💨 Ventilation Configuration](#auto_ventilate_options) below to disable that assumption.
 
 ---
 
@@ -122,6 +126,14 @@ Various different ventilation options.
   <ins>Why the default is the other way round:</ins> on a genuinely hot day the right move is to keep the windows <ins>shut</ins> — closed window plus shading beats anything else, and that is also why a cover parked at the ventilation position rarely bothered anyone. The case this option is for is the one where the tilted window is no longer a decision you can revise: you left the house with the window on tilt and the day turns out warmer than announced. Then keeping the sun out is what is left, and it still helps a lot — even with the window open, a shaded room heats up far more slowly than one the sun shines into.
   <br />
   A roller shutter in the shading position does not seal a tilted window; it only reduces the airflow. Whether that trade is right depends on the room: for a south-facing living room in summer it usually is, for a bathroom it usually is not.
+  <br /><br />
+- <ins>Limit how far cover lowers when a contact sensor state is unreadable:</ins>
+  <br />
+  For the <ins>tilted</ins> contact: an unknown reading resolves as tilted instead of the default "still closed" assumption, holding the cover at the ventilation floor, clearance for a window that may still be open, since a fully closed cover can knock items off a window sill in windy weather. Sun shading still applies down to that floor. Applies whichever the sensor's last known status was, without triggering the wait behavior above.
+  <br />
+  For the <ins>opened</ins> contact: an unknown reading withholds a scheduled close, or the start/end of sun shading, instead of assuming "not open": it never drives the cover. Everything else it drives (the proactive full-open movement, the "hold and wait" behavior above) still requires a real reading.
+  <br />
+  Off by default for both.
 
 ---
 

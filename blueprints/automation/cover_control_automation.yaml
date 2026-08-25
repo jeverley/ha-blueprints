@@ -4,7 +4,7 @@ blueprint:
     # ⭐ Cover Control Automation (CCA) ⭐
     Cover Control Automation is a comprehensive Home Assistant blueprint which automatically manages your window coverings (such as roller shutters and blinds) based on time, the position of the sun, and weather conditions. It adapts intelligently to your preferences, largely eliminating the need for manual adjustments.
 
-    **Version**: 2026.08.14
+    **Version**: 2026.08.14 V2
 
     ### 🔗 Resources & Support
     📢 **Latest Changes**: [Changelog](https://hvorragend.github.io/ha-blueprints/CHANGELOG) | ✨ **Highlights**: [Key Features](https://hvorragend.github.io/ha-blueprints/#key-features)
@@ -1113,6 +1113,8 @@ blueprint:
                   value: "ventilation_keep_open_on_full_to_tilt"
                 - label: "🥵 Sun shading is more important than ventilation: shade even while the window is tilted"
                   value: "shading_over_ventilation"
+                - label: "🚫 Limit how far cover lowers when a contact sensor state is unreadable"
+                  value: "limit_lowering_on_unknown_contact_state"
               multiple: true
               sort: false
               custom_value: false
@@ -2474,6 +2476,9 @@ trigger_variables:
   # Priority of shading over the ventilation floor while the window is tilted
   shading_over_ventilation: "{{ 'shading_over_ventilation' in auto_ventilate_options }}"
 
+  # An unknown/unavailable tilt reading resolves as tilted.
+  limit_lowering_on_unknown_contact_state: "{{ 'limit_lowering_on_unknown_contact_state' in auto_ventilate_options }}"
+
   # Feature enable flag computation
   is_shading_enabled: "{{ 'auto_shading_enabled' in auto_options }}"
   is_up_enabled: "{{ 'auto_up_enabled' in auto_options }}"
@@ -2586,7 +2591,7 @@ trigger_variables:
 ################################################################################
 
 variables:
-  version: "2026.08.14"
+  version: "2026.08.14 V2"
 
   # Force pause
   is_paused: "{{ force_pause != [] and states(force_pause) in ['on', 'true'] }}"
@@ -3018,6 +3023,21 @@ variables:
     allow_shade: "{{ 'resident_allow_shading' in resident_config or not state_resident }}"
     allow_ventilate: "{{ 'resident_allow_ventilation' in resident_config or not state_resident }}"
 
+  # Tilted contact unreadable (or a group with a dropped member) - shared by
+  # effective_state.w, recovered_window, window_tilted_now (design-decisions.md).
+  tilted_invalid: >-
+    {{ contact_window_tilted != [] and
+       states(contact_window_tilted) not in ['true', 'on'] and
+       (states(contact_window_tilted) in invalid_states or
+        expand(contact_window_tilted) | selectattr('state', 'in', invalid_states) | list | count > 0) }}
+  # Opened contact unreadable (or a group with a dropped member) - shared by
+  # lockout_now and shading_end_state (design-decisions.md).
+  opened_invalid: >-
+    {{ contact_window_opened != [] and
+       states(contact_window_opened) not in ['true', 'on'] and
+       (states(contact_window_opened) in invalid_states or
+        expand(contact_window_opened) | selectattr('state', 'in', invalid_states) | list | count > 0) }}
+
   # EFFECTIVE STATE - The actual state the cover should be in based on priority cascade
   # Replaces v5's state_current (which was just an alias with old names vpart/vfull)
   # Use this directly instead of the old state_current variable
@@ -3030,7 +3050,7 @@ variables:
     {% set privacy_active = resident_present and 'resident_closing_enabled' in resident_config %}
     {% set s_opn = is_ventilation_enabled and contact_window_opened != [] and states(contact_window_opened) in ['true', 'on'] %}
     {% set s_tlt = is_ventilation_enabled and contact_window_tilted != [] and states(contact_window_tilted) in ['true', 'on'] %}
-    {% set w = 'opn' if s_opn else 'tlt' if s_tlt else h.win if (contact_window_opened == [] and contact_window_tilted == []) else 'cls' %}
+    {% set w = 'opn' if s_opn else 'tlt' if (s_tlt or (is_ventilation_enabled and tilted_invalid and limit_lowering_on_unknown_contact_state)) else h.win if (contact_window_opened == [] and contact_window_tilted == []) else 'cls' %}
     {% if h.frc != 'non' %}
       {{ h.frc }}
     {% elif w == 'opn' %}
@@ -4077,10 +4097,17 @@ triggers:
       {% set critical_ready = states(blind) not in invalid_states and
            (position_source != 'custom_sensor' or custom_position_sensor == [] or
             states(custom_position_sensor) not in invalid_states) %}
+      {% set tilted_invalid = contact_window_tilted != [] and
+                               states(contact_window_tilted) not in ['true', 'on'] and
+                               (states(contact_window_tilted) in invalid_states or
+                                expand(contact_window_tilted) | selectattr('state', 'in', invalid_states) | list | count > 0) %}
+      {% set opened_invalid = contact_window_opened != [] and
+                               states(contact_window_opened) not in ['true', 'on'] and
+                               (states(contact_window_opened) in invalid_states or
+                                expand(contact_window_opened) | selectattr('state', 'in', invalid_states) | list | count > 0) %}
       {% set contact_missing = is_ventilation_enabled and (
-           (contact_window_opened != [] and states(contact_window_opened) in invalid_states and
-            helper.win | default('cls') == 'opn') or
-           (contact_window_tilted != [] and states(contact_window_tilted) in invalid_states)) %}
+           (opened_invalid and helper.win | default('cls') == 'opn') or
+           (tilted_invalid and not limit_lowering_on_unknown_contact_state)) %}
       {% set contact_ready = helper.win | default('cls') == 'cls' or not contact_missing %}
       {{ attached > 0 and
          (helper.t | default(0) | int) > 0 and
@@ -4177,9 +4204,17 @@ conditions:
       {% set helper = states(cover_status_helper) if cover_status_helper != [] else 'unavailable' %}
       {% set last_window_closed = helper in invalid_states or helper | regex_search('"win"\s*:\s*"cls"') %}
       {% set last_window_open = helper not in invalid_states and helper | regex_search('"win"\s*:\s*"opn"') %}
+      {% set tilted_invalid = contact_window_tilted != [] and
+                               states(contact_window_tilted) not in ['true', 'on'] and
+                               (states(contact_window_tilted) in invalid_states or
+                                expand(contact_window_tilted) | selectattr('state', 'in', invalid_states) | list | count > 0) %}
+      {% set opened_invalid = contact_window_opened != [] and
+                               states(contact_window_opened) not in ['true', 'on'] and
+                               (states(contact_window_opened) in invalid_states or
+                                expand(contact_window_opened) | selectattr('state', 'in', invalid_states) | list | count > 0) %}
       {% set contact_missing = is_ventilation_enabled and (
-           (contact_window_opened != [] and states(contact_window_opened) in invalid_states and last_window_open) or
-           (contact_window_tilted != [] and states(contact_window_tilted) in invalid_states)) %}
+           (opened_invalid and last_window_open) or
+           (tilted_invalid and not limit_lowering_on_unknown_contact_state)) %}
       {{ last_window_closed or not contact_missing or
          trigger.id | default('') in ['t_contact_opened_changed', 't_contact_tilted_changed',
                                       't_manual_position', 't_manual_tilt'] }}
@@ -4867,15 +4902,28 @@ actions:
       # The contact handler re-reads the sensors after its settle delay into
       # its own local variables (contact_opened_now / contact_tilted_now).
       window_opened_now: "{{ contact_window_opened != [] and states(contact_window_opened) in ['true', 'on'] }}"
-      window_tilted_now: "{{ contact_window_tilted != [] and states(contact_window_tilted) in ['true', 'on'] }}"
+      # Confirmed only - lockout_now must not escalate on an unconfirmed reading.
+      window_tilted_confirmed: "{{ contact_window_tilted != [] and states(contact_window_tilted) in ['true', 'on'] }}"
+      window_tilted_now: "{{ window_tilted_confirmed or (limit_lowering_on_unknown_contact_state and tilted_invalid) }}"
       window_any_now: "{{ window_opened_now or window_tilted_now }}"
 
       # Lockout evaluation per context: a fully open window always locks out,
-      # a tilted window only when the matching lockout option is enabled.
+      # a tilted window only when the matching lockout option is enabled. The
+      # unconfirmed-opened fallback (withhold-only, every other consumer stays
+      # confirmed-only) is combined with the toggle inline here and in
+      # shading_end_state below - its only two consumers, both new code, so
+      # there's no shared "_or_unknown" name standing between the toggle and
+      # the decision (design-decisions.md).
       lockout_now:
-        closing: "{{ window_opened_now or (lockout_tilted_when_closing and window_tilted_now) }}"
-        shading_start: "{{ window_opened_now or (lockout_tilted_when_shading_starts and window_tilted_now) }}"
-        shading_end: "{{ window_opened_now or (lockout_tilted_when_shading_ends and window_tilted_now) }}"
+        closing: "{{ window_opened_now or (limit_lowering_on_unknown_contact_state and opened_invalid) or (lockout_tilted_when_closing and window_tilted_confirmed) }}"
+        shading_start: "{{ window_opened_now or (limit_lowering_on_unknown_contact_state and opened_invalid) or (lockout_tilted_when_shading_starts and window_tilted_confirmed) }}"
+        shading_end: "{{ window_opened_now or (limit_lowering_on_unknown_contact_state and opened_invalid) or (lockout_tilted_when_shading_ends and window_tilted_confirmed) }}"
+
+      # win for lockout_now.<key>: "opn" only when confirmed, else preserve helper_state_window.
+      win_on_lockout:
+        closing: "{{ 'opn' if (window_opened_now or (lockout_tilted_when_closing and window_tilted_confirmed)) else helper_state_window }}"
+        shading_start: "{{ 'opn' if (window_opened_now or (lockout_tilted_when_shading_starts and window_tilted_confirmed)) else helper_state_window }}"
+        shading_end: "{{ 'opn' if (window_opened_now or (lockout_tilted_when_shading_ends and window_tilted_confirmed)) else helper_state_window }}"
 
       # Once-per-day shading guard (calendar-date based, Bug Pattern V):
       # true when shading may still start today.
@@ -5889,7 +5937,7 @@ actions:
           recovered_window: >-
             {% set s_opn = is_ventilation_enabled and contact_window_opened != [] and states(contact_window_opened) in ['true', 'on'] %}
             {% set s_tlt = is_ventilation_enabled and contact_window_tilted != [] and states(contact_window_tilted) in ['true', 'on'] %}
-            {{ 'opn' if s_opn else 'tlt' if s_tlt else helper_state_window if (contact_window_opened == [] and contact_window_tilted == []) else 'cls' }}
+            {{ 'opn' if s_opn else 'tlt' if (s_tlt or (is_ventilation_enabled and tilted_invalid and limit_lowering_on_unknown_contact_state)) else helper_state_window if (contact_window_opened == [] and contact_window_tilted == []) else 'cls' }}
 
       - alias: "Recovery: the user's ventilation condition decides the ventilation floor"
         choose:
@@ -6341,11 +6389,11 @@ actions:
                   - "{{ lockout_now.closing }}"
                 sequence:
                   - variables:
-                      log_user: "closing time reached, but the window is open"
+                      log_user: "{{ 'closing time reached, but the window is open' if window_opened_now else 'closing time reached, but the window state is unconfirmed' }}"
                       update_values:
                         bas: "cls"
                         shd: 0
-                        win: "opn"
+                        win: "{{ win_on_lockout.closing }}"
                         pnd: 'non'
                         ts:
                           cls: "now"
@@ -6589,11 +6637,11 @@ actions:
                                   - "{{ lockout_now.shading_start }}"
                                 sequence:
                                   - variables:
-                                      log_user: "sun shading is due, but the window is open"
+                                      log_user: "{{ 'sun shading is due, but the window is open' if window_opened_now else 'sun shading is due, but the window state is unconfirmed' }}"
                                       update_values:
                                         # Shading blocked by lockout, record window state, store shading intent
                                         shd: 1
-                                        win: "opn"
+                                        win: "{{ win_on_lockout.shading_start }}"
                                         pnd: 'non'
                                         ts:
                                           shd: "now"
@@ -6896,7 +6944,7 @@ actions:
                   # Force, Privacy close, or ventilation floor.
                   shading_end_state: >-
                     {% if helper_state_force != 'non' %}{{ helper_state_force }}
-                    {% elif is_ventilation_enabled and window_opened_now %}lock
+                    {% elif is_ventilation_enabled and (window_opened_now or (limit_lowering_on_unknown_contact_state and opened_invalid)) %}lock
                     {% else %}
                       {% set base_target = 'cls' if state_resident and resident_flags.closing_trigger
                                            else 'cls' if helper_state_base == 'opn' and not resident_flags.allow_open
@@ -6947,11 +6995,11 @@ actions:
                       - "{{ lockout_now.shading_end }}"
                     sequence:
                       - variables:
-                          log_user: "sun shading is over, but the window is open"
+                          log_user: "{{ 'sun shading is over, but the window is open' if window_opened_now else 'sun shading is over, but the window state is unconfirmed' }}"
                           update_values:
                             # Shading end blocked by lockout, window is open
                             shd: 0
-                            win: "opn"
+                            win: "{{ win_on_lockout.shading_end }}"
                             pnd: 'non'
                             ts:
                               shd: "now"
@@ -7079,6 +7127,7 @@ actions:
                             {{ shading_end_target_condition_ok and
                                shading_end_opening_allows and shading_end_ventilation_allows and
                                not is_paused and shading_end_force_allows and
+                               not (shading_end_state == 'lock' and not window_opened_now) and
                                (shading_end_state == 'lock' or manual_allows_event.shd) }}
                           log_user: "{{ 'sun shading is over, back to: ' ~ state_labels[shading_end_state] if will_drive else 'sun shading is over, but the cover stays where it is' }}"
                           log_extra: >-
@@ -8045,6 +8094,12 @@ actions:
                   message: "Sun Shading Custom Condition Sensor has invalid state. Must be binary: on/off"
                 - condition: "{{ is_brightness_enabled and (default_brightness_sensor == [] or not is_number(states(default_brightness_sensor))) }}"
                   message: "Brightness sensor not configured or has non-numeric state"
+
+                # ========== VENTILATION CONFIGURATION CHECKS ==========
+                - condition: "{{ limit_lowering_on_unknown_contact_state and not is_ventilation_enabled }}"
+                  message: "'Limit how far cover lowers when a contact sensor state is unreadable' is enabled in Ventilation Configuration, but '💨 Ventilation Mode' is not selected in 'What should CCA control?'. The option has no effect without Ventilation Mode enabled"
+                - condition: "{{ limit_lowering_on_unknown_contact_state and is_ventilation_enabled and contact_window_tilted == [] and contact_window_opened == [] }}"
+                  message: "'Limit how far cover lowers when a contact sensor state is unreadable' is enabled in Ventilation Configuration, but neither a Tilted nor an Open Window Contact sensor is configured. The option has no effect without at least one"
 
                 # ========== SUN ELEVATION MODE CHECKS ==========
                 - condition: >-

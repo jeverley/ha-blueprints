@@ -1175,7 +1175,7 @@ class TestPatternACForceRecoveryVentilationGate:
 
     def test_shading_end_cascade_scopes_both_contact_reads(self, blueprint):
         target = str(_find_variable_definition(blueprint, "shading_end_state"))
-        assert "is_ventilation_enabled and window_opened_now" in target
+        assert "is_ventilation_enabled and (window_opened_now" in target
         assert "is_ventilation_enabled and window_tilted_now" in target
 
     def test_resident_leave_chain_ignores_open_contact_when_disabled(self, blueprint):
@@ -1445,11 +1445,14 @@ class TestPatternAGOpeningLockoutNotDeferredToShading:
         assert "not (is_ventilation_enabled and lockout_now.shading_start)" in conds, (
             f"{alias!r} must gate on the shading-start lockout window (Pattern AG)"
         )
-        # The shared lockout flag itself must implement the full check.
+        # The shared lockout flag itself must implement the full check. It reads
+        # window_tilted_confirmed (a real reading only), not window_tilted_now
+        # (which also counts an opt-in unknown-tilt fallback as tilted) - LOCKOUT
+        # must never escalate on an unconfirmed reading.
         lockout_now = _find_variable_definition(blueprint, "lockout_now")
         gate = str(lockout_now["shading_start"])
         assert "window_opened_now" in gate
-        assert "lockout_tilted_when_shading_starts" in gate and "window_tilted_now" in gate
+        assert "lockout_tilted_when_shading_starts" in gate and "window_tilted_confirmed" in gate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1641,12 +1644,17 @@ class TestPatternATVentHoldSurvivesInvalidOpenedContact:
             "contact_window_tilted": "binary_sensor.tilted",
         }
         flags = dict(base)
-        for name in ("window_opened_now", "window_tilted_now"):
+        # window_tilted_now now references window_tilted_confirmed by name - render
+        # it first, like the blueprint's own evaluation order (both un-stubbed
+        # inputs, limit_lowering_on_unknown_contact_state/tilted_invalid, render as
+        # falsy under jinja2.Undefined, matching this toggle-off-only test's scope).
+        for name in ("window_opened_now", "window_tilted_confirmed", "window_tilted_now"):
             definition = _find_variable_definition(blueprint, name)
             assert definition is not None, f"{name} definition not found"
             flags[name] = (
                 env.from_string(str(definition)).render(**base).strip() == "True"
             )
+            base[name] = flags[name]
         return flags
 
     def _closing_branch_matches(self, blueprint, opened_state, tilted_state) -> bool:

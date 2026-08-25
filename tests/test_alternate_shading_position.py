@@ -435,8 +435,10 @@ class TestReDriveBranch:
         )
         blueprint = _load_blueprint_yaml()
         opened = str(_find_variable_definition(blueprint, "window_opened_now"))
-        tilted = str(_find_variable_definition(blueprint, "window_tilted_now"))
-        assert "contact_window_opened" in opened and "contact_window_tilted" in tilted
+        # window_tilted_now delegates to window_tilted_confirmed for the raw sensor
+        # read (see design-decisions.md); check that, not window_tilted_now itself.
+        tilted_confirmed = str(_find_variable_definition(blueprint, "window_tilted_confirmed"))
+        assert "contact_window_opened" in opened and "contact_window_tilted" in tilted_confirmed
 
     def test_drives_position_via_effective(self, branch):
         seq = str(branch["sequence"])

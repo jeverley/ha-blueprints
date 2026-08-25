@@ -83,8 +83,26 @@ class _States:
         )
 
 
+def _expand(entity_states: dict, group_members: dict) -> callable:
+    """Mocks HA's expand(): a plain entity passes through as its own single-item
+    state list; a registered "group" (group_members) flattens to its members'
+    states instead - mirrors real HA (expand() recurses into anything exposing an
+    entity_id membership attribute, passes everything else through unchanged)."""
+    states_fn = _States(entity_states, {})
+
+    def expand(entity_id):
+        if isinstance(entity_id, list):  # unconfigured input -> []
+            return []
+        members = group_members.get(entity_id)
+        if members is not None:
+            return [types.SimpleNamespace(state=states_fn(m)) for m in members]
+        return [types.SimpleNamespace(state=states_fn(entity_id))]
+
+    return expand
+
+
 def _env(entity_states: dict | None = None, last_changed: dict | None = None,
-         strict: bool = True) -> jinja2.Environment:
+         strict: bool = True, group_members: dict | None = None) -> jinja2.Environment:
     """Jinja env with the HA globals/filters the blueprint templates use.
 
     strict=True makes an unset variable an error instead of an empty string. Without it
@@ -102,6 +120,7 @@ def _env(entity_states: dict | None = None, last_changed: dict | None = None,
 
     env = jinja2.Environment(undefined=jinja2.StrictUndefined if strict else jinja2.Undefined)
     env.globals["states"] = _States(entity_states or {}, last_changed or {})
+    env.globals["expand"] = _expand(entity_states or {}, group_members or {})
     env.globals["now"] = lambda: NOW
     env.globals["today_at"] = today_at
     env.globals["as_timestamp"] = lambda value, default=None: (
@@ -125,15 +144,15 @@ _HANDOVER_OFF = {"instance_active": [], "instance_activated": False,
 
 
 def _render(template_str: str, entity_states: dict | None = None, last_changed: dict | None = None,
-            strict: bool = True, **variables) -> str:
-    env = _env(entity_states, last_changed, strict)
+            strict: bool = True, group_members: dict | None = None, **variables) -> str:
+    env = _env(entity_states, last_changed, strict, group_members)
     return env.from_string(template_str).render(**{**_HANDOVER_OFF, **variables}).strip()
 
 
 def _render_bool(template_str: str, entity_states: dict | None = None, last_changed: dict | None = None,
-                 strict: bool = True, **variables) -> bool:
+                 strict: bool = True, group_members: dict | None = None, **variables) -> bool:
     """Render and parse like HA does (literal_eval); a bare 'false' would be TRUTHY."""
-    out = _render(template_str, entity_states, last_changed, strict, **variables)
+    out = _render(template_str, entity_states, last_changed, strict, group_members, **variables)
     if out == "True":
         return True
     if out == "False":
@@ -429,17 +448,24 @@ class TestHelperGate:
 class TestContactGate:
     GATE = staticmethod(lambda: _condition("last_window_closed"))
 
-    def _run(self, *, contact_state, win, trigger_id="t_close_1", vent=True, tilted_state="off"):
+    def _run(self, *, contact_state, win, trigger_id="t_close_1", vent=True, tilted_state="off",
+             unknown_tilt_ok=False, tilted_entities=None, opened_entities=None, group_members=None):
         helper = '{"bas":"opn","shd":0,"pnd":"non","win":"%s","frc":"non","res":0,"man":0,"v":6}' % win
+        entities = {"input_text.h": helper, "binary_sensor.opened": contact_state,
+                    "binary_sensor.tilted": tilted_state}
+        entities.update(tilted_entities or {})
+        entities.update(opened_entities or {})
         return _render_bool(
             self.GATE(),
-            {"input_text.h": helper, "binary_sensor.opened": contact_state, "binary_sensor.tilted": tilted_state},
+            entities,
             cover_status_helper="input_text.h",
             contact_window_opened="binary_sensor.opened",
             contact_window_tilted="binary_sensor.tilted",
             is_ventilation_enabled=vent,
             invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=unknown_tilt_ok,
             trigger=types.SimpleNamespace(id=trigger_id),
+            group_members=group_members,
         )
 
     def test_stateless_contact_passes_when_window_was_closed(self):
@@ -449,6 +475,35 @@ class TestContactGate:
     def test_stateless_opened_contact_blocks_when_window_was_open(self):
         """Acting would treat the window as closed and drop the lockout."""
         assert self._run(contact_state="unavailable", win="opn") is False
+
+    def test_stateless_opened_contact_still_blocks_regardless_of_the_unknown_tilt_toggle(self):
+        """This gate is deliberately NOT relaxed for the opened contact, unlike for
+        the tilted contact. window_opened_now_or_unknown (the narrow, withhold-only
+        extension used by lockout_now) does not reach here, and must not: a
+        resident-leaving event has no lockout protection of its own in this state
+        (its default leave_target chain reads window_opened_now, confirmed-only)
+        and would close the cover on nothing if this gate stopped blocking."""
+        assert self._run(contact_state="unavailable", win="opn", unknown_tilt_ok=True) is False
+
+    def test_group_member_dropout_on_the_opened_contact_still_blocks(self):
+        """Bug fix: a dropped group member masked behind a determinate aggregate
+        must not bypass this gate's own policy (still block while last known open
+        and now unreadable) - independent of the unknown-tilt toggle."""
+        assert self._run(
+            contact_state="off", win="opn",
+            opened_entities={"binary_sensor.opened_1": "off", "binary_sensor.opened_2": "unavailable"},
+            group_members={"binary_sensor.opened": ["binary_sensor.opened_1", "binary_sensor.opened_2"]},
+        ) is False
+
+    def test_confirmed_on_opened_group_is_not_blocked_by_a_different_dropped_member(self):
+        """Regression: a real 'on' from one member is already sufficient evidence -
+        a DIFFERENT sibling member being unavailable must not make the gate treat
+        the reading as unreliable and block (mirrors the tilted-side guard below)."""
+        assert self._run(
+            contact_state="on", win="opn",
+            opened_entities={"binary_sensor.opened_1": "on", "binary_sensor.opened_2": "unavailable"},
+            group_members={"binary_sensor.opened": ["binary_sensor.opened_1", "binary_sensor.opened_2"]},
+        ) is True
 
     def test_stateless_opened_contact_passes_while_window_is_tilted(self):
         """Issue #622: win == 'tlt' means the opened contact was last known OFF, so its
@@ -483,6 +538,75 @@ class TestContactGate:
 
     def test_ventilation_disabled_ignores_contacts(self):
         assert self._run(contact_state="unavailable", win="opn", vent=False) is True
+
+    @pytest.mark.parametrize("win", ["opn", "tlt"])
+    def test_unknown_tilt_toggle_off_is_byte_for_byte_unchanged(self, win):
+        """Opt-in default: with the toggle off, a stateless tilted contact still blocks
+        exactly as before (regression guard for the toggle being genuinely opt-in)."""
+        assert self._run(contact_state="off", tilted_state="unavailable", win=win,
+                         unknown_tilt_ok=False) is False
+
+    @pytest.mark.parametrize("win", ["opn", "tlt"])
+    def test_unknown_tilt_toggle_on_no_longer_blocks(self, win):
+        """With the toggle on, an unknown/unavailable tilted contact no longer counts
+        as contact_missing - the w resolution routes it to the safe VENT floor instead
+        (see TestEffectiveState/TestRecoveredWindow), so the gate has nothing left to
+        guard against for this sensor."""
+        assert self._run(contact_state="off", tilted_state="unavailable", win=win,
+                         unknown_tilt_ok=True) is True
+
+    def test_unknown_tilt_toggle_does_not_touch_the_opened_contact(self):
+        """Scope: the toggle is deliberately tilted-only. A stateless OPENED contact
+        while the window was last known open must still block, toggle or not - LOCKOUT's
+        assumed direction (fully open) is not a safe assumption under both truths."""
+        assert self._run(contact_state="unavailable", win="opn",
+                         unknown_tilt_ok=True) is False
+
+    # contact_window_tilted may be a "binary sensor group" (domain binary_sensor,
+    # so it passes the entity selector), aggregating several physical sensors. HA's
+    # group only reports unavailable once EVERY member is unavailable - one dropped
+    # member among otherwise-healthy ones leaves the group's own state a determinate
+    # on/off, silently masking that one window. This check is unconditional - it
+    # corrects a pre-existing blind spot in this Tier-2 gate for group-configured
+    # contacts, not a new toggle-gated behaviour (win='tlt' so last_window_closed
+    # does not short-circuit the gate before contact_missing is even reached).
+    def test_group_member_dropout_blocks_when_toggle_is_off(self):
+        """New: previously the group's masking aggregate meant this never blocked."""
+        assert self._run(
+            contact_state="off", win="tlt", tilted_state="off",
+            tilted_entities={"binary_sensor.tilted_1": "off", "binary_sensor.tilted_2": "unavailable"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+            unknown_tilt_ok=False,
+        ) is False
+
+    def test_group_member_dropout_does_not_block_when_toggle_is_on(self):
+        """Toggle on already stops this gate blocking on the tilted contact at all
+        (`not limit_lowering_on_unknown_contact_state` zeroes the clause) - group-awareness
+        changes nothing here, that branch is unreachable either way."""
+        assert self._run(
+            contact_state="off", win="tlt", tilted_state="off",
+            tilted_entities={"binary_sensor.tilted_1": "off", "binary_sensor.tilted_2": "unavailable"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+            unknown_tilt_ok=True,
+        ) is True
+
+    def test_healthy_group_is_unaffected(self):
+        """No dropped member -> the aggregate is trusted as-is, exactly like a plain sensor."""
+        assert self._run(
+            contact_state="off", win="tlt", tilted_state="off",
+            tilted_entities={"binary_sensor.tilted_1": "off", "binary_sensor.tilted_2": "off"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+        ) is True
+
+    def test_confirmed_on_group_is_not_blocked_by_a_different_dropped_member(self):
+        """Regression: a real 'on' from one member is already sufficient evidence -
+        a DIFFERENT sibling member being unavailable must not make the gate treat
+        the reading as unreliable and block."""
+        assert self._run(
+            contact_state="off", win="tlt", tilted_state="on",
+            tilted_entities={"binary_sensor.tilted_1": "on", "binary_sensor.tilted_2": "unavailable"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+        ) is True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1012,6 +1136,14 @@ class TestCaughtUpClosingHold:
                             override_expired=False) is True
 
 
+def _tilted_invalid_ctx(entities, shared, group_members=None):
+    """tilted_invalid as the shared top-level blueprint variable computes it -
+    effective_state/recovered_window/window_tilted_now reference it by name rather
+    than deriving it locally, so isolated renders must supply it explicitly."""
+    ti = _render_bool(BP["variables"]["tilted_invalid"], entities, group_members=group_members, **shared)
+    return {"tilted_invalid": ti}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Recovery gate: recovered_state must stay in sync with effective_state
 # ════════════════════════════════════════════════════════════════════════════
@@ -1067,11 +1199,14 @@ class TestCascadeParity:
             is_opening_scheduled=sched,
             is_ventilation_enabled=vent,
             shading_over_ventilation=sov,
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=False,
         )
+        ti_ctx = _tilted_invalid_ctx(entities, shared)
 
         effective = _render(
             BP["variables"]["effective_state"], entities,
-            helper_json=helper, resident_config=cfg, **shared,
+            helper_json=helper, resident_config=cfg, **shared, **ti_ctx,
         )
         recovered = _render(
             _branch_var(RECOVERY, "recovered_state"), entities,
@@ -1082,7 +1217,7 @@ class TestCascadeParity:
             # the cascade consumes the masked window; with the ventilation condition
             # allowed (the parity default) the mask is the identity
             recovered_cascade_window=_render(_branch_var(RECOVERY, "recovered_window"), entities,
-                                             helper_state_window=helper["win"], **shared),
+                                             helper_state_window=helper["win"], **shared, **ti_ctx),
             recovered_shade=(shd == 1),
             resident_flags={
                 "closing_trigger": "resident_closing_enabled" in cfg,
@@ -1102,6 +1237,94 @@ class TestCascadeParity:
         """A force switched off during the outage leaves frc stale in the helper."""
         tpl = _branch_var(RECOVERY, "recovered_state")
         assert "live_force" in tpl and "helper_state_force" not in tpl
+
+    # limit_lowering_on_unknown_contact_state (opt-in): both cascades must keep agreeing when the
+    # tilted contact itself is unknown/unavailable, toggle on or off (Invariant 13).
+    @pytest.mark.parametrize("toggle", [False, True], ids=["toggle-off", "toggle-on"])
+    @pytest.mark.parametrize("bas", ["opn", "cls"])
+    def test_both_cascades_agree_on_unknown_tilt(self, bas, toggle):
+        entities = {
+            "binary_sensor.opened": "off",
+            "binary_sensor.tilted": "unavailable",
+        }
+        helper = {"bas": bas, "shd": 0, "frc": "non", "win": "cls", "res": 0, "man": 0, "pnd": "non"}
+        shared = dict(
+            contact_window_opened="binary_sensor.opened",
+            contact_window_tilted="binary_sensor.tilted",
+            state_resident=False,
+            is_opening_scheduled=True,
+            is_ventilation_enabled=True,
+            shading_over_ventilation=False,
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=toggle,
+        )
+        ti_ctx = _tilted_invalid_ctx(entities, shared)
+        effective = _render(
+            BP["variables"]["effective_state"], entities,
+            helper_json=helper, resident_config=[], **shared, **ti_ctx,
+        )
+        recovered = _render(
+            _branch_var(RECOVERY, "recovered_state"), entities,
+            live_force="non",
+            new_base=bas,
+            recovered_cascade_window=_render(_branch_var(RECOVERY, "recovered_window"), entities,
+                                             helper_state_window=helper["win"], **shared, **ti_ctx),
+            recovered_shade=False,
+            resident_flags={"closing_trigger": False, "allow_open": True,
+                            "allow_shade": True, "allow_ventilate": True},
+            **shared,
+        )
+        assert recovered == effective
+        if bas == "opn":
+            # BASE=OPN beats VENT whenever an opening schedule exists (Bug Pattern Z) -
+            # the toggle must not override that rule, unknown tilt or not.
+            assert effective == "opn"
+        elif toggle:
+            assert effective == "vnt"
+        else:
+            assert effective == "cls"
+
+    def test_group_member_dropout_is_detected_when_toggle_is_on(self):
+        """contact_window_tilted may be a binary sensor group; a single dropped
+        member must not be masked by the group's own determinate aggregate state -
+        both cascades must still agree."""
+        entities = {
+            "binary_sensor.opened": "off",
+            "binary_sensor.tilted": "off",
+            "binary_sensor.tilted_1": "off",
+            "binary_sensor.tilted_2": "unavailable",
+        }
+        group_members = {"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]}
+        helper = {"bas": "cls", "shd": 0, "frc": "non", "win": "cls", "res": 0, "man": 0, "pnd": "non"}
+        shared = dict(
+            contact_window_opened="binary_sensor.opened",
+            contact_window_tilted="binary_sensor.tilted",
+            state_resident=False,
+            is_opening_scheduled=True,
+            is_ventilation_enabled=True,
+            shading_over_ventilation=False,
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=True,
+        )
+        ti_ctx = _tilted_invalid_ctx(entities, shared, group_members)
+        effective = _render(
+            BP["variables"]["effective_state"], entities,
+            helper_json=helper, resident_config=[], group_members=group_members, **shared, **ti_ctx,
+        )
+        recovered = _render(
+            _branch_var(RECOVERY, "recovered_state"), entities,
+            live_force="non",
+            new_base="cls",
+            recovered_cascade_window=_render(_branch_var(RECOVERY, "recovered_window"), entities,
+                                             helper_state_window=helper["win"],
+                                             group_members=group_members, **shared, **ti_ctx),
+            recovered_shade=False,
+            resident_flags={"closing_trigger": False, "allow_open": True,
+                            "allow_shade": True, "allow_ventilate": True},
+            group_members=group_members,
+            **shared,
+        )
+        assert recovered == effective == "vnt"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1246,14 +1469,20 @@ class TestLiveForceFallback:
 class TestRecoveredWindow:
     TPL = staticmethod(lambda: _branch_var(RECOVERY, "recovered_window"))
 
-    def _run(self, opened, tilted, helper_win="cls", configured=True, vent=True):
+    def _run(self, opened, tilted, helper_win="cls", configured=True, vent=True,
+             unknown_tilt_ok=False):
         entities = {"binary_sensor.opened": opened, "binary_sensor.tilted": tilted}
+        shared = dict(
+            contact_window_tilted="binary_sensor.tilted" if configured else [],
+            is_ventilation_enabled=vent,
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=unknown_tilt_ok,
+        )
         return _render(
             self.TPL(), entities,
             contact_window_opened="binary_sensor.opened" if configured else [],
-            contact_window_tilted="binary_sensor.tilted" if configured else [],
             helper_state_window=helper_win,
-            is_ventilation_enabled=vent,
+            **shared, **_tilted_invalid_ctx(entities, shared),
         )
 
     @pytest.mark.parametrize("opened,tilted,expected", [
@@ -1277,6 +1506,22 @@ class TestRecoveredWindow:
         """Without contacts there is nothing to read - inventing 'cls' would drop the
         window state of a user who drives ventilation from the helper alone."""
         assert self._run("off", "off", helper_win=helper_win, configured=False) == helper_win
+
+    def test_unknown_tilt_toggle_off_is_byte_for_byte_unchanged(self):
+        assert self._run("off", "unavailable", unknown_tilt_ok=False) == "cls"
+
+    def test_unknown_tilt_toggle_on_resolves_as_tilted(self):
+        assert self._run("off", "unavailable", unknown_tilt_ok=True) == "tlt"
+
+    def test_unknown_tilt_toggle_does_not_touch_the_opened_contact(self):
+        """Scope: an unknown OPENED contact must still fall through to 'cls' (or the
+        helper fallback), toggle or not - only the tilted contact is affected."""
+        assert self._run("unavailable", "off", unknown_tilt_ok=True) == "cls"
+
+    def test_opened_contact_still_wins_over_an_unknown_tilt_reading(self):
+        """Invariant 5, with the toggle on: a live opened contact must still beat a
+        toggle-resolved-as-tilted reading."""
+        assert self._run("on", "unavailable", unknown_tilt_ok=True) == "opn"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1751,7 +1996,8 @@ class TestResumeTrigger:
              automation_state="on", automation_entity=None,
              cover_state="open", opened_state="off", tilted_state="off",
              position_source="current_position_attr", custom_sensor_state=None,
-             vent=True):
+             vent=True, unknown_tilt_ok=False, tilted_entities=None, opened_entities=None,
+             group_members=None):
         helper = ('{"bas":"opn","shd":0,"pnd":"non","win":"%s","frc":"non","res":0,"man":0,"v":6,"t":%d}'
                   % (helper_win, helper_t))
         entities = {
@@ -1762,7 +2008,9 @@ class TestResumeTrigger:
             "binary_sensor.tilted": tilted_state,
             "sensor.pos": custom_sensor_state if custom_sensor_state is not None else "unknown",
         }
-        env = _env(entities, last_changed={self.AUTOMATION: attached})
+        entities.update(tilted_entities or {})
+        entities.update(opened_entities or {})
+        env = _env(entities, last_changed={self.AUTOMATION: attached}, group_members=group_members)
         env.globals["now"] = lambda: attached + datetime.timedelta(seconds=now_offset_s)
         env.filters["from_json"] = lambda v, default=None: __import__("json").loads(v)
         out = env.from_string(self._tpl()).render(
@@ -1775,6 +2023,7 @@ class TestResumeTrigger:
             contact_window_opened="binary_sensor.opened",
             contact_window_tilted="binary_sensor.tilted",
             is_ventilation_enabled=vent,
+            limit_lowering_on_unknown_contact_state=unknown_tilt_ok,
         ).strip()
         return out == "True"
 
@@ -1853,6 +2102,64 @@ class TestResumeTrigger:
                          helper_win="tlt", tilted_state="unavailable") is False
         assert self._run(helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
                          helper_win="opn", opened_state="unavailable", vent=False) is True
+
+    def test_stateless_opened_contact_still_blocks_the_resume_trigger_regardless_of_the_toggle(self):
+        """Mirrors TestContactGate: this gate is deliberately not relaxed for the
+        opened contact - see the comment there for why."""
+        assert self._run(helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+                         helper_win="opn", opened_state="unavailable",
+                         unknown_tilt_ok=True) is False
+
+    def test_group_member_dropout_on_the_opened_contact_still_blocks_the_resume_trigger(self):
+        """Mirrors TestContactGate's group-dropout regression: a masked member
+        dropout behind a determinate group aggregate must not bypass this gate's
+        own resume-trigger mirror either."""
+        assert self._run(
+            helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+            helper_win="opn", opened_state="off",
+            opened_entities={"binary_sensor.opened_1": "off", "binary_sensor.opened_2": "unavailable"},
+            group_members={"binary_sensor.opened": ["binary_sensor.opened_1", "binary_sensor.opened_2"]},
+        ) is False
+
+    def test_unknown_tilt_toggle_lets_the_resume_trigger_through_too(self):
+        """limit_lowering_on_unknown_contact_state must also unblock the resume trigger's own
+        mirror of the Tier-2 gate, not just the global condition - otherwise a resumed
+        automation would still wait on exactly the sensor the toggle is meant to stop
+        waiting on."""
+        assert self._run(helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+                         helper_win="tlt", tilted_state="unavailable",
+                         unknown_tilt_ok=False) is False
+        assert self._run(helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+                         helper_win="tlt", tilted_state="unavailable",
+                         unknown_tilt_ok=True) is True
+        # Scope: an unavailable OPENED contact must still block, toggle or not.
+        assert self._run(helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+                         helper_win="opn", opened_state="unavailable",
+                         unknown_tilt_ok=True) is False
+
+    def test_group_member_dropout_blocks_the_resume_trigger_when_toggle_is_off(self):
+        """Same fix as TestContactGate, mirrored here: a stateless member inside an
+        otherwise-healthy binary sensor group must not be masked by the group's own
+        determinate aggregate state. Unconditional, not toggle-gated."""
+        assert self._run(
+            helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+            helper_win="tlt", tilted_state="off",
+            tilted_entities={"binary_sensor.tilted_1": "off", "binary_sensor.tilted_2": "unavailable"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+            unknown_tilt_ok=False,
+        ) is False
+
+    def test_confirmed_on_group_does_not_block_the_resume_trigger(self):
+        """Mirrors TestContactGate's regression guard: a real 'on' from one member
+        is sufficient evidence on its own - a different sibling member being
+        unavailable must not make this gate treat the reading as unreliable."""
+        assert self._run(
+            helper_t=self.STALE_T, attached=self.ATTACHED, now_offset_s=61,
+            helper_win="tlt", tilted_state="on",
+            tilted_entities={"binary_sensor.tilted_1": "on", "binary_sensor.tilted_2": "unavailable"},
+            group_members={"binary_sensor.tilted": ["binary_sensor.tilted_1", "binary_sensor.tilted_2"]},
+            unknown_tilt_ok=False,
+        ) is True
 
     def test_it_is_a_recovery_trigger(self):
         assert any(t.get("value_template") == self._tpl() and t["id"] == "t_recovery"

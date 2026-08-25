@@ -14,6 +14,7 @@ real `enabled:` templates of the real opening triggers - a new opening source th
 to update the flag fails here.
 """
 import pathlib
+import types
 
 import jinja2
 import pytest
@@ -191,6 +192,10 @@ class TestVentFloorAgainstTheRealCascade:
         entity_states = {"binary_sensor.tilted": "on" if tilted else "off"}
         cascade_env = jinja2.Environment(undefined=jinja2.StrictUndefined)
         cascade_env.globals["states"] = lambda entity_id: entity_states.get(entity_id, "unknown")
+        cascade_env.globals["expand"] = lambda entity_id: (
+            [] if isinstance(entity_id, list)
+            else [types.SimpleNamespace(state=entity_states.get(entity_id, "unknown"))]
+        )
         variables.update(
             helper_json=helper,
             state_resident=present,
@@ -199,6 +204,8 @@ class TestVentFloorAgainstTheRealCascade:
             # Every config in this class carries auto_ventilate_enabled; the
             # vent-disabled scoping has its own tests in test_restart_recovery.
             is_ventilation_enabled=True,
+            invalid_states=["", "unavailable", "unknown", "none", "None", "null", "query failed", []],
+            limit_lowering_on_unknown_contact_state=False,
         )
         return cascade_env.from_string(BP["variables"]["effective_state"]).render(**variables).strip()
 

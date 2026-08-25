@@ -543,6 +543,101 @@ class TestBug1WinNotAssertedOnUnconfirmedFallback:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Bug fix: the closing branch's own "no lockout" guard (not
+# lockout_tilted_when_closing) wrongly excluded the unconfirmed/assumed-tilted
+# case too, not just the confirmed case the earlier "Lockout protection when
+# closing" branch already claims via `stop:`. Neither branch fired, and
+# execution fell through to a full close - the exact opposite of what the
+# toggle promises. Its shading_start/shading_end siblings never carried this
+# guard; choose ordering alone already prevents any overlap with the earlier
+# lockout branch, so the guard was never doing useful exclusion work, it was
+# just excluding the wrong case.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestClosingVentFloorReachesUnconfirmedTiltEvenWithLockoutEnabled:
+    ALIAS = "Window tilted. No lockout. Move to ventilation position instead of closing"
+
+    def test_branch_no_longer_guards_on_the_lockout_flag(self):
+        branch = _find_branch_by_alias(BP["actions"], self.ALIAS)
+        assert branch is not None
+        conditions_text = " ".join(str(c) for c in branch["conditions"])
+        assert "lockout_tilted_when_closing" not in conditions_text
+
+    def test_shading_siblings_never_had_this_guard_either(self):
+        """The pattern this branch now matches - confirms the fix brings
+        closing in line with its two siblings, not a new, unverified pattern."""
+        for alias in (
+            "Shading start - hold ventilation floor (window tilted)",
+            "Ventilation after shading ends",
+        ):
+            branch = _find_branch_by_alias(BP["actions"], alias)
+            assert branch is not None, f"branch {alias!r} not found"
+            conditions_text = " ".join(str(c) for c in branch["conditions"])
+            assert "lockout_tilted_when_closing" not in conditions_text
+
+    def _scenario(self, tilted_state, *, unknown_tilt_ok, lockout_tilted_when_closing):
+        """Mirrors TestLockoutDoesNotEscalateOnUnknownTilt._lockout_now, but
+        also renders this branch's own two live conditions, so both halves of
+        the choose: dispatch (does the lockout branch fire first? does this
+        one admit the run if it doesn't?) are visible from one call."""
+        entities = {"binary_sensor.tilted": tilted_state, "binary_sensor.opened": "off"}
+        shared = dict(
+            contact_window_opened="binary_sensor.opened",
+            contact_window_tilted="binary_sensor.tilted",
+            invalid_states=INVALID_STATES,
+            limit_lowering_on_unknown_contact_state=unknown_tilt_ok,
+        )
+        window_opened_now = _render_bool(_action_var("window_opened_now"), entities, **shared)
+        opened_invalid = _render_bool(BP["variables"]["opened_invalid"], entities, **shared)
+        window_tilted_confirmed = _render_bool(
+            _action_var("window_tilted_confirmed"), entities, **shared
+        )
+        tilted_invalid = _render_bool(BP["variables"]["tilted_invalid"], entities, **shared)
+        window_tilted_now = _render_bool(
+            _action_var("window_tilted_now"), entities,
+            tilted_invalid=tilted_invalid,
+            window_tilted_confirmed=window_tilted_confirmed,
+            **shared,
+        )
+        lockout_fires = _render_bool(
+            _action_var("lockout_now")["closing"], entities,
+            window_opened_now=window_opened_now,
+            opened_invalid=opened_invalid,
+            window_tilted_confirmed=window_tilted_confirmed,
+            lockout_tilted_when_closing=lockout_tilted_when_closing,
+            **shared,
+        )
+        vent_floor_admits = window_tilted_now and not window_opened_now
+        return lockout_fires, vent_floor_admits
+
+    def test_confirmed_tilt_with_lockout_enabled_is_claimed_by_the_lockout_branch(self):
+        lockout_fires, vent_floor_admits = self._scenario(
+            "on", unknown_tilt_ok=True, lockout_tilted_when_closing=True,
+        )
+        assert lockout_fires is True       # "Lockout protection when closing" stops the run here
+        assert vent_floor_admits is True   # (this branch is never reached - choose ordering)
+
+    def test_unconfirmed_tilt_with_lockout_enabled_now_reaches_the_vent_floor(self):
+        """The actual regression: before the fix, vent_floor_admits was False
+        here (the stray guard), and with lockout_fires also False (unconfirmed
+        never satisfies the confirmed-only lockout condition), NEITHER branch
+        fired - execution fell through to a full close."""
+        lockout_fires, vent_floor_admits = self._scenario(
+            "unavailable", unknown_tilt_ok=True, lockout_tilted_when_closing=True,
+        )
+        assert lockout_fires is False
+        assert vent_floor_admits is True
+
+    def test_unconfirmed_tilt_with_lockout_disabled_is_unaffected(self):
+        lockout_fires, vent_floor_admits = self._scenario(
+            "unavailable", unknown_tilt_ok=True, lockout_tilted_when_closing=False,
+        )
+        assert lockout_fires is False
+        assert vent_floor_admits is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config validator: the toggle is inert without Ventilation Mode / a configured
 # tilted contact, and should say so.
 # ─────────────────────────────────────────────────────────────────────────────

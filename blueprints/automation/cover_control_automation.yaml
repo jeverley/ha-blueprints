@@ -6411,7 +6411,6 @@ actions:
                   - "{{ resident_flags.allow_ventilate }}"
                   - *auto_ventilate_condition_check
                   - "{{ window_tilted_now }}"
-                  - "{{ not lockout_tilted_when_closing }}"
                   - "{{ not window_opened_now }}"
                 sequence:
                   - variables:

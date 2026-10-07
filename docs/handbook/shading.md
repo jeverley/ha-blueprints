@@ -10,7 +10,7 @@ Settings if the feature '🥵 - Sun Protection / Shading — Partially close whe
 ### How the shading process works (two phases)
 
 **Phase 1 — Pending (trigger):**
-When ANY configured shading trigger fires (sun azimuth, elevation, brightness, temperature, forecast), the automation arms a "pending" timer. This sets the status to <em>t_shading_start_pending</em> and starts the waiting time.
+When ANY configured shading trigger fires (sun azimuth, elevation, brightness, temperature, forecast), the automation arms a "pending" timer. This sets the status to <em>t_shading_start_pending</em> and starts the waiting time. Exception: the <strong>brightness</strong> trigger measures the waiting time itself — it only fires once the brightness has stayed above the start threshold for the whole waiting time without interruption, and its pending then executes immediately.
 
 **Phase 2 — Execution (after waiting time):**
 After the waiting time expires, the automation re-evaluates ALL configured conditions. Only if they are <strong>still valid</strong> at this point, the cover actually moves to the shading position.
@@ -69,6 +69,8 @@ After the waiting time expires, the automation re-evaluates ALL configured condi
 
 **Conditions that MUST ALL be met to START shading**
 
+The two START lists are combined with **AND**: every condition selected here must be met, **and** at least one condition from the optional (OR) list. Conditions without a configured sensor are skipped automatically.
+
 ### How START conditions work
 
 **Required (AND) conditions for START:**
@@ -105,6 +107,8 @@ After the waiting time expires, the automation re-evaluates ALL configured condi
 
 **Conditions where AT LEAST ONE must be met to START shading**
 
+Combined with the required (AND) list using **AND**: all required conditions must be met **and** at least one of the conditions selected here. An empty list is ignored.
+
 ### When to use OR conditions
 
 **Optional (OR) conditions for START:**
@@ -131,12 +135,20 @@ After the waiting time expires, the automation re-evaluates ALL configured condi
 
 **Conditions that MUST ALL become invalid to END shading**
 
+⚠️ Unlike START, the two END lists are combined with **OR**: shading ends as soon as **every** condition selected here has become invalid — **or** as soon as **any single** condition from the optional (OR) list has. A condition placed here on its own is therefore a complete end condition by itself, not an extra requirement for the OR list. To require several conditions together, put them all in this list and leave the OR list empty.
+
 ### How END conditions work
 
 **Required (AND) conditions for END:**
 - ALL selected conditions must become invalid
-- Shading continues if ANY is still valid
+- Shading continues if ANY of *this list* is still valid — but an OR condition becoming invalid still ends the shading
 - Use for stable shading (avoid flickering)
+
+**Pitfall - A single condition in the AND list:**
+- AND: Forecast Temperature
+- OR: Azimuth, Elevation, Brightness
+- Intention: "keep shading while the forecast is hot, otherwise end by sun position/brightness"
+- Actual result: on a cool day the AND group is fully invalid all day long, so the **first** end trigger of any kind ends the shading, and a shading re-detection cannot cancel it. On a hot day the sun/brightness conditions end it as usual — the forecast never *holds* the shading. Use *"Independent Shading: Keep shading active while the temperature threshold is exceeded"* ([Sun Shading - Configuration](#shading_config)) for a real hot-day hold instead
 
 **Example - Quick response:**
 - AND: (empty)
@@ -159,6 +171,8 @@ After the waiting time expires, the automation re-evaluates ALL configured condi
 > 🧩 Input: `shading_conditions_end_or` · Default: `['cond_azimuth', 'cond_elevation', 'cond_brightness', 'cond_temp1', 'cond_temp2', 'cond_forecast_temp', 'cond_forecast_weather']`
 
 **Conditions where AT LEAST ONE must become invalid to END shading**
+
+Combined with the required (AND) list using **OR**: shading ends when any one of the conditions selected here becomes invalid, **or** when all conditions of the AND list have. An empty list is ignored.
 
 ### Typical END configurations
 
@@ -184,6 +198,10 @@ After the waiting time expires, the automation re-evaluates ALL configured condi
 **Combined logic:**
 - Final = (ALL AND invalid) OR (ONE OR invalid)
 - The AND group and the OR group are themselves combined with **OR** (unlike START, where they are combined with AND). To require several end conditions together, put them ALL in the AND group and leave the OR group empty.
+
+---
+
+**Tilt covers (venetian blinds):** The elevation-based tilt stages keep following the sun as long as the shading is active. If the slats should stop tracking once the sun has left the azimuth range, "Sun Azimuth" must end the shading — put it into the OR group. See [How elevation-based tilt tracking works](tilt#tilt-tracking).
 
 ---
 
@@ -327,7 +345,11 @@ Minimum temperature for sensor 1 above which shading should occur.
 
 > 🧩 Input: `shading_temperature_hysteresis1` · Default: `0.2`
 
-Shading will end only when temperature drops below (minimum - hysteresis value) to prevent frequent open/close cycles. See: [FAQ: How does hysteresis work?](https://hvorragend.github.io/ha-blueprints/FAQ#q-how-does-hysteresis-work)
+Prevents frequent open/close cycles near the minimum value. The hysteresis applies on both sides:
+- Shading starts: temperature > (minimum + hysteresis)
+- Shading ends: temperature < (minimum - hysteresis)
+
+Example: minimum 22 °C and hysteresis 1 °C → shading starts above 23 °C and ends below 21 °C. See: [FAQ: How does hysteresis work?](https://hvorragend.github.io/ha-blueprints/FAQ#q-how-does-hysteresis-work)
 
 ---
 
@@ -357,7 +379,11 @@ Minimum temperature for sensor 2 above which shading should occur.
 
 > 🧩 Input: `shading_temperature_hysteresis2` · Default: `0.2`
 
-Shading will end only when temperature drops below (minimum - hysteresis value) to prevent frequent open/close cycles. See: [FAQ: How does hysteresis work?](https://hvorragend.github.io/ha-blueprints/FAQ#q-how-does-hysteresis-work)
+Prevents frequent open/close cycles near the minimum value. The hysteresis applies on both sides:
+- Shading starts: temperature > (minimum + hysteresis)
+- Shading ends: temperature < (minimum - hysteresis)
+
+Example: minimum 22 °C and hysteresis 1 °C → shading starts above 23 °C and ends below 21 °C. See: [FAQ: How does hysteresis work?](https://hvorragend.github.io/ha-blueprints/FAQ#q-how-does-hysteresis-work)
 
 ---
 
@@ -543,7 +569,7 @@ Temperature threshold used exclusively by the <em>"Independent Shading via Tempe
 
 > 🧩 Input: `shading_waitingtime_start` · Default: `300`
 
-Waiting time between the initial shading trigger and the actual cover movement. After this time expires, <ins>all</ins> configured start conditions (AND + OR) are re-checked. The cover only moves if conditions are <strong>still valid</strong> at execution time. This waiting time is also used for the periodic condition checks within the retry loop. <br /><br /> <strong>If shading stays at "pending" and never executes:</strong> The conditions were no longer met after the waiting time expired. Check the automation trace for <em>t_shading_start_execution</em>.
+Waiting time between the initial shading trigger and the actual cover movement. After this time expires, <ins>all</ins> configured start conditions (AND + OR) are re-checked. The cover only moves if conditions are <strong>still valid</strong> at execution time. This waiting time is also used for the periodic condition checks within the retry loop. <br /><br /> For the <strong>brightness</strong> start condition the waiting time runs inside the trigger: the brightness has to stay above the start threshold for the whole waiting time <strong>without interruption</strong> (a dip in between restarts it), and the cover then moves right away. Shading starts armed by the sun position, the temperatures, the forecast or the 1-hour pre-opening check keep the waiting time in the pending and re-check the brightness when it expires. <br /><br /> <strong>If shading stays at "pending" and never executes:</strong> The conditions were no longer met after the waiting time expired. Check the automation trace for <em>t_shading_start_execution</em>.
 
 ---
 
@@ -572,7 +598,7 @@ when weather is highly unstable (rapidly changing clouds).
 
 > 🧩 Input: `shading_waitingtime_end` · Default: `300`
 
-To avoid excessive load on the motor, a waiting time can be defined here before the shading is ended. Shading ends if one of the conditions is not fulfilled for the entire waiting time. This waiting time is also used for the periodic condition checks within the retry loop.
+To avoid excessive load on the motor, a waiting time can be defined here before the shading is ended. Shading ends if one of the conditions is not fulfilled for the entire waiting time <strong>without interruption</strong>: if a sensor value (brightness, temperature, forecast, weather, custom sensor) recovers in between, the waiting time starts over. For the sun position (azimuth/elevation) the waiting time starts once the sun has left the configured range. This waiting time is also used for the periodic condition checks within the retry loop.
 
 ---
 

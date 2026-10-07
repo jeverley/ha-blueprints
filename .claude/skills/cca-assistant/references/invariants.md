@@ -138,7 +138,7 @@ midnight reset, and recovery of an expired override) remain explicit updates.
 - `pnd: 'non'` always implies `ts.due == 0` and `ts.arm == 0`. Terminal branches must set all three together.
 - Retry-continuation branches must set `pnd: 'beg'` (or `'end'`) and the new `ts.due`, but **not** `ts.arm` — `helper_update` preserves the existing value automatically when a key is omitted.
 - Terminal branches that clear pending:
-  - Start: Drive, Lockout-skip, Save-for-future, no-drive default of the drive choose, Abort (shared retry routine)
+  - Start: Drive, Lockout-skip, Save-for-future, no-drive default of the drive choose, Abort (shared retry routine; reconciles an `opn` target behind the normal-opening gates — Bug Pattern AY)
   - End: Tilt-only, Lockout, Ventilation, Move-cover (then/else and the opening-prevented else), Stop retry, stale-pending cleanup (#395)
   - Midnight reset (BRANCH 11, "Reset shading status")
 - A force/manual enable, disable, detection or release must **not** clear these
@@ -396,6 +396,14 @@ the older manual intent without suppressing the reducer.
 
 - Manual detection writes only `man: 1` and `ts.man`; it never derives the
   autonomous state from the physical position and never clears pending timers.
+  One documented opt-in exception (#671, `manual_schedule_adoption`): a manual
+  move classified as "opened"/"closed" inside the matching schedule window
+  (`is_opening_phase` / `is_closing_phase`) additionally advances `bas` and
+  stamps `ts.opn`/`ts.cls`, exactly as the scheduled event would — state
+  progress only. The handler still never drives, never touches
+  `shd`/`pnd`/`win`/`frc`/`res`, and the adoption writer deliberately does not
+  join `is_opening_scheduled` (it never actuates a flip — the Bug Pattern AV
+  exception rule). See the design-decisions entry for the full rationale.
 - A pending shading execution that matures while movement is blocked commits
   `shd: 1` (or clears it on a matured end) and suppresses only the drive.
 - Scheduled base transitions and live contact/resident updates persist normally.
@@ -404,10 +412,13 @@ the older manual intent without suppressing the reducer.
 - Force targets override `effective_state`, while the background fields continue
   to evolve. Force pause changes no target at all; it only makes every drive gate
   false.
-- When manual, force or pause ends, the release path reconciles the current
-  `effective_state`; it does not replay old triggers or restart their delays.
-  Force disable recovery and Force-Pause resume are explicit hand-over events,
-  so a dispatched movement may clear an older Manual Override.
+- When manual, force or pause ends, the release path reconciles the target that
+  is valid now; it does not replay old triggers or restart their delays. An
+  explicit timeout, fixed-time or position Manual reset first re-derives the
+  scheduled base through the recovery reducer, because the cached base may
+  predate a missed/refused schedule event. Force disable recovery and
+  Force-Pause resume reconcile the current `effective_state` as explicit
+  hand-over events, so a dispatched movement may clear an older Manual Override.
 
 Lockout remains the safety exception that may drive over manual intent. Explicit
 force targets remain target overrides rather than inhibitors. Tests:

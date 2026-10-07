@@ -638,6 +638,80 @@ class TestClosingVentFloorReachesUnconfirmedTiltEvenWithLockoutEnabled:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# An unconfirmed tilt only caps lowering: it never raises a cover that sits below
+# the ventilation position (vent_raise_hold, a drive gate - state still advances).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestUnconfirmedTiltNeverRaises:
+    def _hold(self, *, toggle=True, vent_enabled=True, tilted_invalid=True,
+              confirmed=False, below=True, live_force="non"):
+        return _render_bool(
+            _action_var("vent_raise_hold"), {},
+            limit_lowering_on_unknown_contact_state=toggle,
+            is_ventilation_enabled=vent_enabled,
+            tilted_invalid=tilted_invalid,
+            window_tilted_confirmed=confirmed,
+            position_comparisons={"current_below_ventilate": below},
+            live_force=live_force,
+        )
+
+    def test_unconfirmed_tilt_with_cover_below_vent_holds(self):
+        assert self._hold() is True
+
+    def test_cover_at_or_above_vent_still_lowers_to_the_floor(self):
+        assert self._hold(below=False) is False
+
+    def test_confirmed_tilt_still_raises(self):
+        assert self._hold(confirmed=True, tilted_invalid=False) is False
+
+    def test_toggle_off_is_unchanged(self):
+        assert self._hold(toggle=False) is False
+
+    def test_ventilation_disabled_is_unchanged(self):
+        assert self._hold(vent_enabled=False) is False
+
+    @pytest.mark.parametrize("force", ["opn", "cls", "shd", "vnt"])
+    def test_live_force_keeps_its_own_authority(self, force):
+        assert self._hold(live_force=force) is False
+
+    def _vnt_gate(self, hold):
+        return _render_bool(
+            _action_var("state_gates")["vnt"], {},
+            is_paused=False, force_allows_ventilate=True, vent_raise_hold=hold,
+            effective_state="vnt", in_ventilate_position=False,
+        )
+
+    def test_vnt_gate_withholds_the_drive_while_held(self):
+        assert self._vnt_gate(True) is False
+
+    def test_vnt_gate_open_when_not_held(self):
+        assert self._vnt_gate(False) is True
+
+    @pytest.mark.parametrize("alias", [
+        "Resident arriving: window tilted → hold ventilation position",
+        "Resident leaving: target VENTILATION (window tilted)",
+    ])
+    def test_resident_hold_branches_drive_through_the_gate(self, alias):
+        branch = _find_branch_by_alias(BP["actions"], alias)
+        assert branch is not None, alias
+        will_drive = branch["sequence"][0]["variables"]["will_drive"]
+        assert "state_gates.vnt" in will_drive
+
+    @pytest.mark.parametrize("name", [
+        "recovery_allowed", "shading_end_force_allows", "reset_force_allows",
+    ])
+    def test_other_vnt_drive_gates_consult_the_hold(self, name):
+        assert "vent_raise_hold" in _find_variable_definition(BP["actions"], name)
+
+    def test_remaining_vnt_drive_sites_consult_the_hold(self):
+        text = BLUEPRINT_PATH.read_text(encoding="utf-8")
+        # definition + state_gates.vnt, recovery, shading-start floor, shading end,
+        # force-pause resume, force-disable return, manual reset
+        assert text.count("vent_raise_hold") >= 8
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Config validator: the toggle is inert without Ventilation Mode / a configured
 # tilted contact, and should say so.
 # ─────────────────────────────────────────────────────────────────────────────

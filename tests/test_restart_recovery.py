@@ -140,7 +140,14 @@ def _env(entity_states: dict | None = None, last_changed: dict | None = None,
 _HANDOVER_OFF = {"instance_active": [], "instance_activated": False,
                  "instance_active_value": "",
                  "instance_active_on_states": ["on", "true"],
-                 "midnight_reset_missed": False}
+                 "midnight_reset_missed": False,
+                 "manual_reset_event": False,
+                 "manual_reset_recovery_hold": False,
+                 # manual schedule adoption (#671) off unless a test opts in
+                 "adopt_flags": {"opening": False, "closing": False},
+                 # #673 mirror baseline: an owned closing target, no hold
+                 "closing_ownership_hold": False,
+                 "closing_target_owned": True}
 
 
 def _render(template_str: str, entity_states: dict | None = None, last_changed: dict | None = None,
@@ -711,6 +718,21 @@ class TestOverrideExpired:
                 return
         raise AssertionError("recovery branch does not write man")
 
+    def test_a_live_reset_is_claimed_by_the_schedule_aware_reducer(self):
+        """The numbered reset branch only knows the cached effective state. A reset
+        must enter recovery first so it can reconstruct a base transition that was
+        missed or refused while the manual override was active."""
+        assert any("manual_reset_event" in str(c) for c in _branch_gate(RECOVERY))
+
+    @pytest.mark.parametrize("tid", [
+        "t_reset_timeout", "t_reset_fixedtime", "t_reset_position",
+    ])
+    def test_every_live_reset_is_a_reconciliation_event(self, tid):
+        assert _render_bool(
+            _top_var("manual_reset_event"), {},
+            helper_state_manual=True, trigger=types.SimpleNamespace(id=tid),
+        ) is True
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Recovery gate: base state re-derived from the schedule
@@ -751,9 +773,12 @@ class TestRecoveredBase:
         otherwise drive the cover OPEN on a 2 am restart."""
         assert self._run(time_up_early_today="22:00:00", helper_state_base="opn") == "cls"
 
-    def test_night_without_a_closing_schedule_keeps_the_helper_base(self):
+    def test_night_without_a_closing_feature_still_flips(self):
+        """#673 mirror: the night clause is state progress and no longer gated on
+        is_down_enabled - the closing-owned drives are withheld separately via
+        closing_ownership_hold / caught_up_closing_hold."""
         assert self._run(time_up_early_today="22:00:00", is_down_enabled=False,
-                         helper_state_base="opn") == "opn"
+                         helper_state_base="opn") == "cls"
 
     def test_calendar_night_before_the_open_event_closes(self):
         assert self._run(is_time_field_enabled=False, is_calendar_enabled=True,
@@ -773,8 +798,10 @@ class TestRecoveredBase:
     def test_time_control_disabled_keeps_the_helper_base(self):
         assert self._run(is_time_control_disabled=True, is_evening_phase=True, helper_state_base="opn") == "opn"
 
-    def test_no_closing_schedule_does_not_invent_one(self):
-        assert self._run(is_down_enabled=False, is_evening_phase=True, helper_state_base="opn") == "opn"
+    def test_the_evening_flip_no_longer_needs_the_closing_feature(self):
+        """#673 mirror: the schedule (not the feature switch) owns the base state;
+        an unchecked Evening Closing suppresses only the closing-owned drives."""
+        assert self._run(is_down_enabled=False, is_evening_phase=True, helper_state_base="opn") == "cls"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1046,9 +1073,20 @@ class TestCaughtUpClosingHold:
         base = dict(caught_up_closing=True, recovered_state="cls",
                     closing_position_hold=position_hold,
                     is_ventilation_enabled=True, recovered_window="cls",
-                    lockout_tilted_when_closing=False)
+                    lockout_tilted_when_closing=False,
+                    is_down_enabled=True, recovered_down_ok=True, live_force="non")
         base.update(over)
         return _render_bool(self.HOLD(), {}, **base)
+
+    def test_a_refused_closing_condition_holds_the_vnt_floor(self):
+        """#698 mirror of the is_down_enabled clause: the vnt floor of a
+        caught-up closing is closing-owned, so the refused closing condition
+        withholds it like the live tilted-ventilation will_drive does."""
+        assert self._hold(recovered_state="vnt", recovered_window="tlt",
+                          recovered_down_ok=False) is True
+        assert self._hold(recovered_state="vnt", recovered_window="tlt",
+                          recovered_down_ok=False, live_force="cls") is False
+        assert self._hold(recovered_state="vnt", recovered_window="tlt") is False
 
     # --- the shared position rules (one source of truth with the live branch) ---
     def test_without_the_options_nothing_holds(self):
@@ -1118,22 +1156,97 @@ class TestCaughtUpClosingHold:
     def test_the_drive_gate_consumes_it(self):
         will_drive = _branch_var(RECOVERY, "will_drive")
         assert "caught_up_closing_hold" in will_drive
+        assert "caught_up_opening_hold" in will_drive
+        assert "closing_ownership_hold" in will_drive
         assert "transition_manual_allows" in will_drive
         assert "recovery_vent_condition_hold" in will_drive
+        assert "recovery_up_condition_hold" in will_drive
+        assert "recovery_down_condition_hold" in will_drive
         assert _render_bool(will_drive, {}, recovery_catch_up=True, is_paused=False,
-                            recovery_allowed=True, caught_up_closing_hold=True,
+                            recovery_allowed=True, caught_up_closing_hold=False,
+                            caught_up_opening_hold=False,
+                            closing_ownership_hold=True,
                             transition_manual_allows=True,
                             recovery_vent_condition_hold=False,
+                            recovery_up_condition_hold=False,
+                            recovery_down_condition_hold=False,
+                            recovered_state="cls", caught_up_closing=True,
+                            manual_allows_event={"vnt": True},
+                            override_expired=False) is False
+        assert _render_bool(will_drive, {}, recovery_catch_up=True, is_paused=False,
+                            recovery_allowed=True, caught_up_closing_hold=True,
+                            caught_up_opening_hold=False,
+                            transition_manual_allows=True,
+                            recovery_vent_condition_hold=False,
+                            recovery_up_condition_hold=False,
+                            recovery_down_condition_hold=False,
                             recovered_state="cls", caught_up_closing=True,
                             manual_allows_event={"vnt": True},
                             override_expired=False) is False
         assert _render_bool(will_drive, {}, recovery_catch_up=True, is_paused=False,
                             recovery_allowed=True, caught_up_closing_hold=False,
+                            caught_up_opening_hold=False,
                             transition_manual_allows=True,
                             recovery_vent_condition_hold=False,
+                            recovery_up_condition_hold=False,
+                            recovery_down_condition_hold=False,
                             recovered_state="cls", caught_up_closing=True,
                             manual_allows_event={"vnt": True},
                             override_expired=False) is True
+        assert _render_bool(will_drive, {}, recovery_catch_up=True, is_paused=False,
+                            recovery_allowed=True, caught_up_closing_hold=False,
+                            caught_up_opening_hold=True,
+                            transition_manual_allows=True,
+                            recovery_vent_condition_hold=False,
+                            recovery_up_condition_hold=False,
+                            recovery_down_condition_hold=False,
+                            recovered_state="opn", caught_up_closing=False,
+                            manual_allows_event={"vnt": True},
+                            override_expired=False) is False
+        assert _render_bool(will_drive, {}, recovery_catch_up=True, is_paused=False,
+                            recovery_allowed=True, caught_up_closing_hold=False,
+                            caught_up_opening_hold=False,
+                            transition_manual_allows=True,
+                            recovery_vent_condition_hold=False,
+                            recovery_up_condition_hold=True,
+                            recovery_down_condition_hold=False,
+                            recovered_state="opn", caught_up_closing=False,
+                            manual_allows_event={"vnt": True},
+                            override_expired=False) is False
+
+
+class TestCaughtUpOpeningHold:
+    """The live normal-opening will_drive is feature-gated on is_up_enabled (#673):
+    with Morning Opening unchecked the base flip persists as state-only. The
+    caught-up opening mirrors exactly that - and ONLY that: overlay targets
+    (lock/vnt/shd/cls) and a live force-open keep their own drive authority."""
+
+    HOLD = staticmethod(lambda: _branch_var(RECOVERY, "caught_up_opening_hold"))
+
+    def _hold(self, **over):
+        base = dict(caught_up_opening=True, recovered_state="opn",
+                    is_up_enabled=False, live_force="non")
+        base.update(over)
+        return _render_bool(self.HOLD(), {}, **base)
+
+    def test_a_caught_up_opening_without_the_feature_is_state_only(self):
+        assert self._hold() is True
+
+    def test_the_enabled_feature_drives(self):
+        assert self._hold(is_up_enabled=True) is False
+
+    def test_overlay_targets_keep_their_own_authority(self):
+        for state in ("lock", "vnt", "shd", "cls"):
+            assert self._hold(recovered_state=state) is False
+
+    def test_a_live_force_open_still_drives(self):
+        assert self._hold(live_force="opn") is False
+
+    def test_only_a_caught_up_opening_is_gated(self):
+        """A plain re-position to an unchanged bas == 'opn' keeps today's semantics
+        (schedule-less setups reconcile to the open position regardless of the
+        Morning Opening checkbox)."""
+        assert self._hold(caught_up_opening=False) is False
 
 
 def _tilted_invalid_ctx(entities, shared, group_members=None):
@@ -1703,6 +1816,7 @@ class TestRecoveredDueAndArm:
 class TestRecoveryDrive:
     LOCKOUT = staticmethod(lambda: _branch_var(RECOVERY, "lockout_blocks_shading"))
     DEFER = staticmethod(lambda: _branch_var(RECOVERY, "defer_to_shading"))
+    DEFER_END = staticmethod(lambda: _branch_var(RECOVERY, "defer_to_shading_end"))
     TARGET = staticmethod(lambda: _branch_var(RECOVERY, "target_position"))
     TILT = staticmethod(lambda: _branch_var(RECOVERY, "target_tilt_position"))
     ALLOWED = staticmethod(lambda: _branch_var(RECOVERY, "recovery_allowed"))
@@ -1744,6 +1858,35 @@ class TestRecoveryDrive:
 
     def test_no_defer_when_the_target_is_not_open(self):
         assert self._defer("beg", "cls", lockout=False) is False
+
+    # --- defer_to_shading_end ---
+    def _defer_end(self, pending, state, live_force="non"):
+        return _render_bool(self.DEFER_END(), {}, recovered_pending=pending,
+                            recovered_state=state, live_force=live_force)
+
+    def test_a_shading_drive_is_deferred_to_the_armed_end_pending(self):
+        """#674: the end conditions already hold, so the armed end pending will move
+        the cover after one waiting period - driving into the shading position first
+        (e.g. on an instance take-over with the cover standing open) is a movement
+        that is immediately reverted."""
+        assert self._defer_end("end", "shd") is True
+
+    def test_a_live_force_shade_keeps_its_own_authority(self):
+        """recovered_state == 'shd' from a live force-shade owns its target - the
+        end pending must not withhold that drive."""
+        assert self._defer_end("end", "shd", live_force="shd") is False
+
+    def test_no_end_defer_without_an_end_pending(self):
+        assert self._defer_end("non", "shd") is False
+        assert self._defer_end("beg", "shd") is False
+
+    def test_no_end_defer_when_the_target_is_not_shading(self):
+        """Overlay targets (lockout, the vent floor) and base targets keep their
+        drives - only the about-to-end shading target itself is withheld."""
+        assert self._defer_end("end", "lock") is False
+        assert self._defer_end("end", "vnt") is False
+        assert self._defer_end("end", "cls") is False
+        assert self._defer_end("end", "opn") is False
 
     # --- targets ---
     POSITIONS = dict(open_position=100, close_position=0, ventilate_position=50, shading_position=30,
@@ -1821,9 +1964,14 @@ class TestRecoveryDrive:
     def _allowed(self, state, **over):
         base = dict(force_allows_open=True, force_allows_close=True,
                     force_allows_shade=True, force_allows_ventilate=True,
-                    defer_to_shading=False, manual_holds_reposition=False)
+                    defer_to_shading=False, defer_to_shading_end=False,
+                    manual_holds_reposition=False, vent_raise_hold=False)
         base.update(over)
         return _render_bool(self.ALLOWED(), {}, recovered_state=state, **base)
+
+    def test_an_unconfirmed_tilt_never_raises_in_recovery(self):
+        assert self._allowed("vnt", vent_raise_hold=True) is False
+        assert self._allowed("lock", vent_raise_hold=True) is True
 
     @pytest.mark.parametrize("state,blocking", [
         ("lock", "force_allows_ventilate"), ("vnt", "force_allows_ventilate"),
@@ -1836,6 +1984,9 @@ class TestRecoveryDrive:
 
     def test_deferring_to_shading_means_no_drive_here(self):
         assert self._allowed("opn", defer_to_shading=True) is False
+
+    def test_deferring_to_the_shading_end_means_no_drive_here(self):
+        assert self._allowed("shd", defer_to_shading_end=True) is False
 
     # --- the manual policy: conservative for re-positioning, live parity for transitions ---
     MANUAL = staticmethod(lambda: _branch_var(RECOVERY, "manual_holds_reposition"))
@@ -2441,6 +2592,12 @@ class TestRecoveryTriggers:
         assert _render_bool(gate, {}, trigger=types.SimpleNamespace(id="t_recovery"),
                             automation_resumed=False) is True
 
+    def test_forecast_is_loaded_for_a_live_manual_reset(self):
+        """A reset runs the recovery reducer, including recovered shading."""
+        gate = next(c for c in self._forecast_gate() if "regex_match" in c)
+        assert _render_bool(gate, {}, trigger=types.SimpleNamespace(id="t_reset_timeout"),
+                            manual_reset_event=True, automation_resumed=False) is True
+
     @pytest.mark.parametrize("tid", ["t_close_1", "t_resident_update", "t_contact_tilted_changed"])
     def test_forecast_is_loaded_on_a_resumed_run_claimed_by_any_trigger(self, tid):
         """The resumed-run backstop turns ANY trigger into a recovery, and that run evaluates
@@ -2467,9 +2624,11 @@ class TestRecoveryTriggers:
                 return [c for c in or_cond["or"] if isinstance(c, str)]
         raise AssertionError("no calendar.get_events step found")
 
-    def _calendar_gate_passes(self, tid: str, resumed: bool) -> bool:
+    def _calendar_gate_passes(self, tid: str, resumed: bool,
+                              manual_reset_event: bool = False) -> bool:
         return any(_render_bool(c, {}, trigger=types.SimpleNamespace(id=tid),
-                                automation_resumed=resumed)
+                                automation_resumed=resumed,
+                                manual_reset_event=manual_reset_event)
                    for c in self._calendar_gate_or())
 
     def test_calendar_events_are_loaded_for_the_recovery(self):
@@ -2482,6 +2641,12 @@ class TestRecoveryTriggers:
         is silently dead for every calendar-controlled user. recovered_due/arm lose the
         window-start deferral (Bug Pattern L) the same way."""
         assert self._calendar_gate_passes("t_recovery", resumed=False) is True
+
+    def test_calendar_events_are_loaded_for_a_live_manual_reset(self):
+        """The reset's recovered base may depend on a calendar opening/closing."""
+        assert self._calendar_gate_passes(
+            "t_reset_timeout", resumed=False, manual_reset_event=True
+        ) is True
 
     @pytest.mark.parametrize("tid", ["t_resident_update", "t_contact_tilted_changed"])
     def test_calendar_events_are_loaded_on_a_resumed_run_claimed_by_any_trigger(self, tid):
@@ -2607,22 +2772,74 @@ class TestRecoveryTriggers:
         replayed as if it had merely been missed (real report: opening blocked all morning by
         an additional condition, a restart flipped bas to opn and the cover opened). The flip
         direction decides which condition applies, so it has to be a choose; the shared
-        anchor keeps the downstream reconciliation structurally identical."""
+        anchor keeps the downstream reconciliation structurally identical.
+
+        Since #698 (and its closing mirror) both direction conditions are effect
+        gates like is_up_enabled / is_down_enabled: neither flip carries a !input
+        condition any more - the base state advances, and recovery_up_condition_hold /
+        recovery_down_condition_hold withhold the drive toward the open / close
+        position (the report's movement stays suppressed, only the state
+        progresses). The choose stays: the flip direction decides which base and
+        which recovered_shade the shared body reconciles."""
         branches = self._direction_gate()["choose"]
-        by_input = {
-            next(c["condition"] for c in b["conditions"]
-                 if isinstance(c, dict) and "condition" in c):
-            next(c for c in b["conditions"] if isinstance(c, str))
-            for b in branches
-        }
-        assert set(by_input) == {"auto_up_condition", "auto_down_condition"}
-        assert "'opn'" in by_input["auto_up_condition"]
-        assert "'cls'" in by_input["auto_down_condition"]
+        opening = next(b for b in branches if "opening" in b["alias"])
+        closing = next(b for b in branches if "closing" in b["alias"])
+        for branch in (opening, closing):
+            assert not any(isinstance(c, dict) and "condition" in c
+                           for c in branch["conditions"]), branch["alias"]
+        assert "'opn'" in next(c for c in opening["conditions"] if isinstance(c, str))
+        assert "'cls'" in next(c for c in closing["conditions"] if isinstance(c, str))
         # Both flip branches and the default run the SAME body (the anchor), so refusing a
         # flip never costs the hygiene - it only keeps the base state.
         bodies = [b["sequence"][-1]["default"] for b in branches]
         bodies.append(self._direction_gate()["default"][-1]["default"])
         assert all(body is bodies[0] for body in bodies), "the shared body is not one anchor"
+
+    def test_the_opening_condition_is_evaluated_before_the_flip_and_holds_the_drive(self):
+        """#698: the opening condition is evaluated once, before the flip, into
+        recovered_up_ok; the hold withholds exactly the opn drive (flip AND
+        reposition - a restart at noon must not open a cover the condition kept
+        closed all morning), and a live force-open keeps its own authority."""
+        step = next(s for s in _walk_steps(_branch_body(RECOVERY))
+                    if "opening condition" in str(s.get("alias", "")))
+        assert step["if"] == [{"condition": "auto_up_condition"}]
+        assert step["then"][0]["variables"]["recovered_up_ok"] is True
+        assert step["else"][0]["variables"]["recovered_up_ok"] is False
+        hold = _branch_var(RECOVERY, "recovery_up_condition_hold")
+        assert _render_bool(hold, {}, recovered_state="opn", recovered_up_ok=False,
+                            live_force="non") is True
+        assert _render_bool(hold, {}, recovered_state="opn", recovered_up_ok=True,
+                            live_force="non") is False
+        assert _render_bool(hold, {}, recovered_state="opn", recovered_up_ok=False,
+                            live_force="opn") is False
+        for state in ("lock", "vnt", "shd", "cls"):
+            assert _render_bool(hold, {}, recovered_state=state, recovered_up_ok=False,
+                                live_force="non") is False
+        # the hold is a drive gate, never a write gate
+        assert "recovered_up_ok" not in str(_recovery_update_values())
+        assert "recovery_up_condition_hold" not in str(_recovery_update_values())
+
+    def test_the_closing_condition_is_evaluated_before_the_flip_and_holds_the_drive(self):
+        """#698 mirror: same shape for the closing condition - recovered_down_ok
+        before the flip, recovery_down_condition_hold on exactly the cls drive,
+        a live force-close keeps its authority."""
+        step = next(s for s in _walk_steps(_branch_body(RECOVERY))
+                    if "closing condition" in str(s.get("alias", "")))
+        assert step["if"] == [{"condition": "auto_down_condition"}]
+        assert step["then"][0]["variables"]["recovered_down_ok"] is True
+        assert step["else"][0]["variables"]["recovered_down_ok"] is False
+        hold = _branch_var(RECOVERY, "recovery_down_condition_hold")
+        assert _render_bool(hold, {}, recovered_state="cls", recovered_down_ok=False,
+                            live_force="non") is True
+        assert _render_bool(hold, {}, recovered_state="cls", recovered_down_ok=True,
+                            live_force="non") is False
+        assert _render_bool(hold, {}, recovered_state="cls", recovered_down_ok=False,
+                            live_force="cls") is False
+        for state in ("lock", "vnt", "shd", "opn"):
+            assert _render_bool(hold, {}, recovered_state=state, recovered_down_ok=False,
+                                live_force="non") is False
+        assert "recovered_down_ok" not in str(_recovery_update_values())
+        assert "recovery_down_condition_hold" not in str(_recovery_update_values())
 
     def test_recovery_flag_is_a_static_trigger_variable(self):
         """`enabled:` is evaluated in the limited trigger context (Invariant 10) - the flags

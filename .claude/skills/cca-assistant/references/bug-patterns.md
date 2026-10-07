@@ -1,4 +1,4 @@
-# CCA Known Bug Patterns (A–AS, with cause and fix)
+# CCA Known Bug Patterns (A–AU, with cause and fix)
 
 The regression catalog. Most patterns are pinned by tests, but the *rules*
 derived from them apply to new code. Read the matching pattern before changing
@@ -384,7 +384,7 @@ Additionally, the "Check for shading start" branch entry OR ("Check the helper s
 
 **Rule:** A fix in the actions is only real once every gate *upstream* of it (trigger `enabled`, trigger `for`, **global conditions**, branch conditions) provably lets the triggering event through in the exact scenario being fixed. When adding an action branch keyed to a trigger id, always re-check the global trigger gate for that id.
 
-**Deliberate asymmetry (reporter's "FWIW"):** The gate still suppresses `t_shading_end_pending_[1-7]` while shading is inactive (`shd == 0`), even though a shading-**start** pending may be armed. This is intentional: the start side is documented as a *retry loop* ("After the waiting time expires, the automation re-evaluates ALL configured conditions. Only if they are still valid at this point, the cover actually moves") — momentary interruptions during the start wait are tolerated by design, and the execution re-check plus `shading_start_max_duration` budget already handle unmet conditions. Canceling a start-pending on an end trigger would also break the pre-window arming flows (Bug Patterns L/S/R). Do not "harmonize" the end side of the gate.
+**Deliberate asymmetry (reporter's "FWIW"):** The gate still suppresses `t_shading_end_pending_[1-7]` while shading is inactive (`shd == 0`), even though a shading-**start** pending may be armed. This is intentional: the start side is documented as a *retry loop* ("After the waiting time expires, the automation re-evaluates ALL configured conditions. Only if they are still valid at this point, the cover actually moves") — momentary interruptions during the start wait are tolerated by design, and the execution re-check plus `shading_start_max_duration` budget already handle unmet conditions. Canceling a start-pending on an end trigger would also break the pre-window arming flows (Bug Patterns L/S/R). Do not "harmonize" the end side of the gate. Since CCA 2026.10.04 the **brightness** start trigger (`t_shading_start_pending_2`) holds the waiting time via `for:` (#696 follow-up) — that changes *when its edge arrives*, not the retry-loop design: a pending armed by any other start trigger still re-checks the brightness by sampling, exactly as described here.
 
 **Known residual window of that asymmetry (documented 2026.07.25, accepted):** a shading-**end**
 condition whose false→true edge falls into the start-pending window is *consumed*, not deferred.
@@ -567,6 +567,8 @@ Gating `is_time_field_enabled`/`is_calendar_enabled` on the checkbox is essentia
 **Second recurrence (Issue #608, CCA 2026.07.13 V7) — same swallow, different gate:** after the reorder, the ventilation branch could still be skipped on tilt covers whose shading position **equals** the ventilate position (venetian setups: closed/shading/ventilate all share one cover position, only the slat angle differs — the `tilt_position_tolerance` input documents this setup explicitly). At shading end the cover rests exactly *at* the ventilate position, so `current_below_ventilate` is false and the equality alternative was gated behind `ventilation_flags.if_lower_enabled` — the branch fell through to the tilt-only branch again, which now tilted the slats to `open_tilt_position` (the very value the AJ fix introduced) instead of `ventilate_tilt_position`. The contact handler's tilted branch had a third alternative for exactly this case; the shading-end branch lacked it. Fix: add the same tilt-cover alternative (`is_cover_tilt_enabled_and_possible` AND at/below ventilate position AND `current_tilt_position <= ventilate_tilt_position`) to the shading-end ventilation branch's position OR. **Rule:** when two branches in different handlers implement the same cascade decision (here: "does VENT bind at this position?"), their position ORs must stay alternative-for-alternative identical — a missing alternative in one handler is a dormant swallow bug (same family as the 2026.07.12 V2 bracketing fix between these two branches).
 
 **Third recurrence (Issue #615, CCA 2026.07.25) — the slat-angle guard makes the ventilate state unreachable:** the tilt-cover alternative copied around in the #608 fix carried a guard `current_tilt_position <= ventilate_tilt_position` ("slats not yet beyond the ventilate angle — don't pull them down"). The #615 trace shows the flow that breaks it: shading ends with the window still **closed**, so the tilt-only branch legitimately opens the slats to `open_tilt_position` (100). The user then tilts the window — and the contact handler's tilted branch finds slats *beyond* the ventilate angle, so the drive alternative fails; `in_ventilate_position` also fails (it checks the tilt angle within `tilt_position_tolerance`, #558), so the sync-only branch fails too, and with `effective_state == 'vnt'` **no branch consumes the tilt event at all**: no drive, no `win: 'tlt'` sync. The knock-on is worse than the missing movement — when the window later closes, `was_ventilating` is false (helper `win` still `'cls'`, cover not in ventilate position), so the return branch is skipped as well; the whole ventilation cycle is dead and the slats stay at the open angle. The guard's "already ventilating enough" floor-rationale contradicts the state model: `in_ventilate_position` does *not* accept a more-open slat angle, so the system simultaneously said "not in the ventilate state" and "refuse to drive there". Fix: drop the slat-angle guard from **both** ORs (contact tilted + shading-end ventilation, keeping them alternative-for-alternative identical) — a tilted window on a tilt cover at/below the ventilate position always resolves to the configured ventilate target, from any slat angle. **Rule:** a drive gate must never contradict its own position checker — if `in_X_position` says the cover is not in state X, some branch must be able to drive to X (or deliberately record why not); a gate that blocks the only path to a reachable-by-definition state creates a dead zone where events are swallowed with no helper write.
+
+**Fourth recurrence (Issue #667, CCA 2026.08.21) — exact equality vs. reported resting position:** the tilt-cover alternative accepted the shared-position venetian setup only via `current_position == ventilate_position`. Many motors report the resting position a point or two off the commanded value — the #538 caveat (tilt movement shifts the reported `current_position`) documents exactly this — so a cover commanded to 0 rested at 1 and the equality failed. With the slats at the shading angle, `in_ventilate_position` also failed (tilt outside `tilt_position_tolerance`), so in the contact handler **no branch consumed the tilt event** (same swallow shape as the third recurrence: no drive, no `win: 'tlt'` sync, `effective_state == 'vnt'`); in the shading-end handler the event fell through to the reconciliation branch (wrong action set, no `win` update). Fix: extend the tilt-cover alternative in **both** ORs (alternative-for-alternative identical) with `((current_position - ventilate_position) | abs <= position_tolerance and not in_ventilate_position)`. The `not in_ventilate_position` guard is load-bearing: without it, a cover *near* the position with the slats already within tilt tolerance would newly take the drive branch instead of the sync-only branch — re-dispatching the tilt, clearing `man` and running the ventilate action pipeline. The exact-equality alternative is kept alongside (it is **not** redundant: exact position + slats in tolerance drives today, and must keep doing so). Tests: `tests/test_blueprint_logic.py` (`test_issue_667_*`), `tests/test_shading_end_priority.py`. **Rule:** never compare `current_position` to a target with `==` in any gate — covers do not reliably report the commanded value; use `position_tolerance` (or the `in_X_position` checker), and when widening a drive gate from equality to tolerance, exclude the fully-in-position case so the sync-only branch keeps owning it.
 
 ---
 
@@ -837,5 +839,363 @@ is binding — any handler that interprets a window contact must read an invalid
 consistent with the gate that decided to let the run through. Tests:
 `TestPatternATVentHoldSurvivesInvalidOpenedContact` in
 `tests/test_documented_bug_patterns.py`.
+
+---
+
+### Bug Pattern AU: Manual reset actuates a stale cached base (Issue #655 follow-up)
+
+**Symptom:** A cover is opened manually before or during the daytime. When the Manual
+Override timeout expires, the reset closes it again even though the scheduled target is
+open. The logbook says `manual override reset, back to: closed`.
+
+**Cause:** Invariant 15 correctly stopped manual detection from deriving `bas` from the
+physical position. That exposed a latent reset assumption: the numbered reset branch
+projected `effective_state` directly from the cached helper. If a scheduled opening run
+had been missed, gated or refused before persisting its base transition, `bas` could still
+be yesterday's `cls`; releasing Manual Override then actuated that stale value. The reset
+itself is the first reliable reconciliation edge, so merely waiting for another opening
+trigger can strand the wrong target for the whole day.
+
+**Fix:** `manual_reset_event` claims every live timeout, fixed-time and position reset in
+the pre-dispatch recovery reducer and makes that run catch up independently of the user's
+restart/outage recovery opt-in. The reducer re-derives `recovered_base` from the current
+schedule with the same once-per-day, environment, calendar and additional-condition gates,
+then clears `man`, runs the configured reset action and reconciles `recovered_state`.
+Forecast and calendar load gates explicitly include this entry path.
+
+**The inverse is not this bug (#668):** if a user closes a cover manually while the
+currently valid automatic target is still `opn`, an explicit timeout reset opens it again.
+That is the configured hand-back, not a stale-base failure: the reset has ended Manual
+Override and the opening schedule still owns the target. Keeping that manual close requires
+a longer timeout or no timed reset. Do not special-case the physical direction of the manual
+move; doing so would reintroduce the coupling this fix removes and would break the original
+#655 requirement to return to a still-current shading/opening target after reset.
+
+**Rule:** A blocker-release path must not assume its cached background target is current
+when the mechanisms that maintain that target can lose or refuse one-shot events. Make the
+release an explicit reconciliation edge and route it through the existing schedule-aware
+reducer, including every upstream data-load gate that reducer consumes. Tests:
+`TestManualOverrideParity::test_live_timeout_reconstructs_a_missed_daytime_opening`,
+`TestOverrideExpired::test_a_live_reset_is_claimed_by_the_schedule_aware_reducer`, and the
+manual-reset forecast/calendar gate tests in `TestRecoveryTriggers`.
+### Bug Pattern AV: `bas` has no writer back to 'opn' when Morning Opening is unchecked — the evening close latches forever (Issue #673)
+
+**Symptom:** A config with **Evening Closing but no Morning Opening** (`auto_down_enabled`
+set, `auto_up_enabled` not set — the user opens by hand every morning; time fields or
+another schedule source configured). The **mirror config** (Morning Opening set, Evening
+Closing unchecked — closing by hand) latches `bas: 'opn'` the same way: after a manual
+evening close the next reconciliation **reopens the cover in the middle of the night**. After the first automatic evening close the cover
+starts driving **back to the close position in the middle of the day**: after every
+manual-override expiry (`t_reset_timeout` etc.), after a sun-shading end, on a recovery
+run. The helper shows `bas: 'cls'` around the clock, the status card is stuck on "Night
+Mode". With shading active the bug is masked (SHADING outranks BASE=CLS — the cover moves
+to the shading position anyway) and reappears the day shading is disabled.
+
+**Cause:** `bas: 'opn'` had exactly two writers — the opening branch and the recovery's
+caught-up opening — and **both were gated on `is_up_enabled`** (plus the resident-leaving
+handler, which only re-writes an existing `'opn'`). `bas: 'cls'` only needs
+`is_down_enabled`. So in this config `bas` was a one-way street: after the first evening
+close nothing could ever expire the `'cls'`, and `effective_state` fell through to
+BASE=CLS all day. Latent for a long time — it only became visible when the #655/#657
+rework (2026.08.02) made blockers-release reconciliation actually *drive*
+`effective_state` (the override reset used to write `man: 0` without a movement, and the
+position-based reset re-derived `bas` from the physical position; both repair paths were
+replaced by cascade reconciliation, which faithfully replayed the stale `'cls'`).
+
+**Fix:** `is_up_enabled` is an **effect gate, not an existence gate** (Invariant 15
+applied to the feature switch): the opening-time triggers exist whenever any schedule
+source is configured, so the base transition to `'opn'` must persist even with Morning
+Opening unchecked — only the opening *movement* stays with the feature.
+
+- Live: `is_up_enabled` removed from the "Check for opening" entry conditions; added to
+  the "Normal opening" `will_drive` instead. All other sub-branch drives keep their own
+  ownership (shading catch-up → shading gates, full-window reconciliation → lockout
+  safety).
+- Recovery: the `recovered_base` daytime clause drops `is_up_enabled`; the new
+  `caught_up_opening_hold` (`caught_up_opening and recovered_state == 'opn' and not
+  is_up_enabled and live_force == 'non'`) withholds exactly the opening-owned drive.
+  Overlay targets (`lock`/`vnt`/`shd`/`cls`) and a live force-open keep their authority.
+- `is_opening_scheduled` is deliberately **unchanged**: the sync writer never drives, so
+  it is not a source of "real open intent" — the VENT floor keeps applying (#553/AL/AO
+  preserved). This is the documented exception to the AL/AO rule "every new `bas='opn'`
+  writer joins `is_opening_scheduled`": that rule is about writers *whose flip an
+  automation will actuate*.
+- **Mirror (closing side, 2026.08.23 V2):** `is_down_enabled` moves from the closing
+  entry into the two closing-owned drives (normal closing AND the tilted-ventilation
+  leaf — C-B is the closing event's own floor, unlike the opening side where `vnt` is
+  contact-owned and recovery reconciles it as R3). `recovered_base` flips on the phases
+  alone. Crucially, the closing side had an **implicit invariant the opening side never
+  had**: `bas == 'cls'` used to imply "a closing automation exists", and four drive
+  consumers were built on it ungated. The mirror therefore ships WITH the ownership
+  layer: `is_closing_scheduled` (trigger_variables, mirror of the driving t_close
+  sources) + `closing_target_owned` (action scope; adds the live resident privacy
+  ownership) gate every automatic drive toward the close position — the recovery
+  (`closing_ownership_hold`, covering flips, repositions and opted-in manual resets),
+  the window-closed return (`is_closing_scheduled or resident_blocks_open or
+  in_ventilate_position` — undoing a real ventilation hold stays allowed), the
+  partial-ventilation pull-down clause (`current_above_ventilate and effective_state ==
+  'cls'`), the shading-end move, the force-disable return and the force-pause resume.
+  A live force-close keeps its authority at every consumer. The `vnt` floor of a
+  caught-up closing is held via the third clause of `caught_up_closing_hold`.
+
+**Rule:** Every schedule-derived helper field needs a writer for **both** directions of
+its transition under every feature-switch combination that leaves any of its triggers
+armed — a feature switch may suppress the movement, never the state progress. And the
+moment a state value can exist without its owning automation, every drive consumer of
+that value needs an explicit ownership gate (`is_opening_scheduled` /
+`closing_target_owned`) — an implicit "this value implies the feature" invariant does
+not survive new writers. When a
+state field can only be entered but not left in some configuration, every consumer of the
+cascade inherits the stale value sooner or later. Tests:
+`TestIssue673MorningOpeningUnchecked` (paired live/recovery) in
+`tests/test_recovery_live_parity.py`, `TestCaughtUpOpeningHold` in
+`tests/test_restart_recovery.py`.
+
+---
+
+### Bug Pattern AW: The recovery drives into a shading whose end it just armed (Issue #674)
+
+**Symptom:** An instance take-over (`instance_active` switched on) or a restart catch-up
+runs while the helper still says `shd: 1` but the shading **end** conditions already hold
+(sun past the end azimuth, brightness dropped, …). The recovery correctly arms the end
+pending (`pnd: 'end'`, due after one `shading_waitingtime_end`) — and **simultaneously
+drives the cover to the shading position**, because `recovered_state` is `'shd'`. One
+waiting period later the shading end moves it back. User-visible as "I turned the
+automation's switch on and the cover drove to its *old* position": a fully open cover
+dips to the shading depth for a few minutes for no reason.
+
+**Cause:** `recovered_pending` re-evaluates the shading ("re-evaluated, not replayed",
+recovery.md) and the shading-end *execution* owns the eventual movement — but nothing
+connected the freshly armed end pending to the recovery's own drive gate. The start side
+had exactly this link (`defer_to_shading`, #555: don't open first when a start pending
+will shade a moment later); the end side did not.
+
+**Fix:** `defer_to_shading_end` (`recovered_pending == 'end' and recovered_state ==
+'shd' and live_force == 'non'`) joins `recovery_allowed`: the helper write (shd kept,
+end pending armed) still happens, only the movement is withheld and left to the shading
+end execution — which then reconciles from wherever the cover actually stands (usually a
+no-op via the apply-transition tolerance). A live force-shade keeps its own authority
+(its `'shd'` target has an owner). Accepted residual: if the end conditions un-cross
+before the due time (a transient dip at exactly the recovery moment), the end aborts and
+the cover stays un-shaded while `shd` reads 1 — the same "not warranted *now*" trade the
+environment-flip and pending re-evaluation already make (recovery-parity.md R5).
+
+**Rule:** When the recovery arms a pending that will move the cover shortly, its own
+drive toward the *same* flow's target must defer to that pending's execution — in both
+directions (start: `defer_to_shading`; end: `defer_to_shading_end`). A recovery movement
+that the just-armed pending will revert is a replay, not a reconciliation. Tests:
+`TestRecoveryDrive` (defer_to_shading_end cases) in `tests/test_restart_recovery.py`.
+
+---
+
+### Bug Pattern AX: Per-step dead-band swallows manual moves on covers that report intermediate positions (forum report)
+
+**Symptom:** A genuine manual movement (e.g. full open by wall switch at 06:24) is never
+recorded: `man` stays `0`, `ts.man` unchanged, no helper write at all although
+`this.last_triggered` proves the `t_manual_position` run fired (position stable + 60 s
+later, 06:25:45). The next automatic event — in the report, the "window closed → return
+to background state" contact branch — then drives straight over the hand-set position.
+Affects only covers whose integration reports **several position updates during one
+travel** (Zigbee/Shelly/KNX-style live feedback); single-report covers are fine.
+
+**Cause:** Bug Pattern Q's drift dead-band compares `trigger.from_state` against
+`trigger.to_state` — but with `for: 60` on an attribute trigger, every intermediate
+report re-arms the timer with a fresh from/to pair, so at fire time `from_state` is the
+**penultimate report of the travel**, not the position before the movement. The measured
+"delta" is only the final reporting step (e.g. 97 → 100 = 3), which on granular covers
+is ≤ `position_tolerance` — the whole 0 → 100 hand movement classifies as drift. All
+other branch-9 entry conditions provably pass (settle window keyed on `d`, Bug Pattern
+AP), so the run falls through to the terminal "No operational branch matched" stop with
+no helper write — silently, every time; the `for: 60` never re-fires on the stable
+position (same loss mode as AP).
+
+**Fix:** The per-step dead-band stays (it is Q's protection), but each cover-attribute
+source accepts the event alternatively when `trigger.from_state.state in ['opening',
+'closing']` — a from_state captured while the cover was physically travelling proves a
+real motor movement, which outside the `d` settle window is by definition not CCA's own
+drive and never idle drift (drift reports arrive with the cover idle, state
+`open`/`closed`). No schema change, no new suppression.
+
+**Residuals (accepted, documented):**
+- A cover that reports granular positions but **never** exposes `opening`/`closing`
+  states, and the pathological ordering "state flips back to `open` *before* the final
+  position refinement", both keep the blind spot — workaround: `position_tolerance: 0`
+  (Q's note) at the cost of drift sensitivity.
+- The `custom_sensor` source is unchanged: a sensor has no motion state, and a
+  last-changed/last-updated burst heuristic false-positives on periodically recomputing
+  template sensors and attribute-chatty entities.
+- If `drive_time` underestimates the real travel time, CCA's own drive can already
+  escape the `d` settle window today; the movement-state disjunct widens that existing
+  exposure from single-report to granular covers. `drive_time` must cover the real
+  travel time — pre-existing input contract, not new.
+
+**Rule:** The dead-band measures one *reporting step*, never the *movement* — any
+condition that must classify a movement needs a movement-scoped signal (motion state,
+`d` window), not a per-event delta. Tests: `tests/test_manual_detection_movement.py`.
+
+---
+### Bug Pattern AY: The opening handler hands the opening over to a shading execution the user has gated off (trace report, 2026-09-29)
+
+**Symptom:** On the first warm forecast day after the user switched their seasonal
+shading off (`auto_shading_start_condition` = an `input_boolean` that is `off`), no cover
+in the house opened in the morning. Helper at 08:37: `bas=opn`, `shd=0`, `pnd=beg`,
+`ts.arm` = exactly the opening time, `ts.opn` re-stamped by every later opening trigger,
+cover at 0 %. The execution trigger logged `blocked by=auto_shading_start_condition;
+elapsed=4860s/7200s` every 300 s, and at `ts.arm + shading_start_max_duration` the retry
+routine aborted with a pending clear and **no movement**. No opening trigger fires again
+that day, so the cover stayed closed until the evening close.
+
+**Cause:** Two independently correct pieces. (1) `shading_start_warranted` deliberately
+includes the independent-temperature path — with forecast 26.9 °C ≥ threshold 26 °C the
+shading is "warranted" from dawn on regardless of azimuth (106°, window 245–360°) and
+brightness (2 600 lx vs. 45 000 lx). (2) The opening handler's two handoff branches
+("Opening: Shading warranted, arm pending" #555 and "Opening skipped: Shading start
+pending" #514) gate on `shading_start_warranted`, which claims to "mirror the execution
+gate" — but the execution gate is `condition: !input auto_shading_start_condition`
+**and** the warranted variable. The user condition can only be evaluated as a YAML
+condition, never inside a template variable, so the mirror silently left it out. The
+handoff therefore consumed the opening obligation and passed it to a flow whose only
+outcomes while the condition is false are retry and abort; the abort path (Bug Pattern S
+already documented that a condition false through the whole window ends there) cleared
+the pending without reconciling the cover. The handbook names exactly this use for the
+condition ("temporarily disable", "only in the summer season").
+
+**Fix (two layers, same commit):**
+1. Both handoff branches evaluate the user's condition through the shared
+   `*auto_shading_start_condition_check` anchor (definition moved to the arm branch, the
+   first consumer in document order; the execution uses the alias). With the condition
+   false the run falls through to "Normal opening", which drives the cover open and
+   clears `pnd`/`ts.due`/`ts.arm` — the same fall-through #514 uses for a stale pending.
+2. Safety net for every other abort (conditions no longer met, recovery-armed pending,
+   a condition that flips false mid-window): the abort `default:` of `&shading_start_retry`
+   reconciles the open target behind the normal-opening entry **and** drive gates
+   (`effective_state == 'opn'`, `not in_open_position`, `is_up_enabled`, `base_gates.opening.*`,
+   `resident_flags.allow_open`, `force_allows_open`, `not is_paused`). Invariant 15: a
+   pending is a blocker that may hold the opening back; releasing it reconciles the
+   current `effective_state`. Any other target (`vnt`, `shd`, `lock`, `cls`) stands down —
+   its owning flow positioned the cover.
+
+**Accepted trade:** a user who used the start condition as a *time-of-day* gate
+("shade only after 09:00") no longer gets the opening held back for that window — the
+cover opens, and the shading needs a later pending trigger. That was never the documented
+purpose of the condition, and a cover stuck closed all day is the worse failure. The
+recovery's `recovered_pending` still cannot read the user condition (template context);
+a restart with the condition off arms a pending that now ends in the reconciling abort
+after `shading_start_max_duration` instead of a permanently closed cover.
+
+**Rule:** a variable that claims to mirror a gate containing a user `!input` condition
+mirrors it only where the branch **also** evaluates that condition as a YAML condition.
+Every handoff that consumes an obligation (open, close, lockout) must be able to prove
+the receiving flow can deliver it under the same user conditions — otherwise it must not
+consume it (same shape as Bug Pattern AG, where the receiving flow was the lockout-store).
+Tests: `tests/test_documented_bug_patterns.py::TestPatternAYShadingGateOffMustNotHoldTheOpening`,
+`::TestPatternAYAbortReconcilesTheOpening`.
+
+---
+
+### Bug Pattern AZ: The opening condition gated the whole opening event — a refused `auto_up_condition` latched the evening `cls` all day (Issue #698)
+
+**Symptom:** Morning Opening enabled plus an **Additional Condition For Opening** that is
+false on most days (the FAQ's vacation pattern: only open while `input_boolean.vacation_mode`
+is `on`). On a normal day the user opens the cover by hand; every later reconciliation that
+reads `bas` — a sun-shading end, an opted-in Manual Override reset, a force disable, a
+restart catch-up — drives the cover **back to the close position**. The exact #673 (Bug
+Pattern AV) failure shape, reached through the condition instead of the feature switch.
+
+**Cause:** `&auto_up_condition_check` sat in the top-level `conditions:` of "Check for
+opening" (and, since V6, in the recovery's opening flip), so a refused condition blocked
+**every** sub-branch — including "Already in open position - only update base state" and
+the shading-pending arming — although the branch's own comment already declared the base
+flip as state progress that must not depend on the opening drive, and the FAQ had promised
+since 2026.08.22 that "the per-action conditions only suppress that one movement — the
+background state tracking stays intact". `bas: 'cls'` therefore had no writer back to
+`'opn'` while the condition was false: Invariant 15 (blockers suppress effects, never state
+progress) was violated for exactly this blocker.
+
+**Fix:** `auto_up_condition` is an **effect gate on the open target**, the same class as
+`is_up_enabled` (AV) — but evaluated *at drive time* wherever the open position is the
+destination, because unlike the feature switch it cannot join `is_opening_scheduled` (a
+`!input` condition is not expressible in `trigger_variables`, Invariant 10):
+
+- Live opening: the node leaves the entry conditions; "Normal opening" evaluates it once
+  (`up_condition_ok`, an `if:` at the top of the sub-branch) and its `will_drive` consumes
+  it next to `is_up_enabled`. The shading-detected drive and the full-window lockout
+  reconciliation keep their own ownership, exactly as in AV.
+- Recovery: the anchored node is evaluated once **before** the flip (`recovered_up_ok`);
+  the opening flip carries no `!input` condition any more; `recovery_up_condition_hold`
+  (`recovered_state == 'opn' and not recovered_up_ok and live_force == 'non'`) withholds
+  every `opn` drive — flip **and** reposition. The V6 real-world report ("blocked all
+  morning, a restart flipped `bas` and the cover opened") is covered by the hold, not by
+  refusing the flip: a restart at noon with the condition still refused keeps the cover
+  where it is, and a live force-open keeps its authority.
+- Reconciliations toward `opn` outside the opening branch: the shading-end move gains an
+  "opening target allowed" branch in its target-condition `choose`; the window-closed
+  return gains `return_condition_ok`; the shading-start abort reconciliation (Bug Pattern AY)
+  gains `abort_up_condition_ok`. Manual Override reset, force disable and force pause
+  already evaluated the condition through `target_condition_gate`.
+- **Closing mirror (same release):** `auto_down_condition` gets the identical treatment —
+  out of the "Check for closing cover" entry and the closing flip, evaluated once per path
+  (`down_condition_ok` / `recovered_down_ok`), consumed by the two closing-owned drives, the
+  vnt clause of `caught_up_closing_hold`, `recovery_down_condition_hold`, the shading-end
+  close target, the window-closed close return, both resident chains (`leave_condition_ok`,
+  `arrive_condition_ok` — the privacy close is a closing movement, gated like its
+  `is_down_enabled` switch) and the partial-ventilation pull-down clause toward an owned
+  closing. Two more sites than the opening side, same pattern — see design-decisions.md.
+
+**Accepted consequence** (changelog): with the condition refused and the cover left closed,
+the day state reads `'opn'`, so a sun-shading start raises the closed cover to the shading
+position (shading-owned, gated by `auto_shading_start_condition`) and the shading end then
+leaves it there because the open drive is held. Previously the shading was only stored for
+the future. "No movement at all during vacation" is `auto_shading_start_condition` on the
+same entity, or Force Close.
+
+**Rule:** A per-action additional condition is the user's veto on *that movement*. It
+gates the drive at its point of use — and every reconciliation whose destination is that
+movement's target — never the state transition, and never the entry of the branch that
+carries the transition. Tests: `TestIssue698OpeningConditionRefused` (paired
+live/recovery) and `TestClosedEntryStructure` in `tests/test_recovery_live_parity.py`,
+`test_the_opening_condition_is_evaluated_before_the_flip_and_holds_the_drive` in
+`tests/test_restart_recovery.py`, the shading-end verdict test in
+`tests/test_shading_end_priority.py`.
+
+---
+
+### Bug Pattern BA: Force-pause resume actuates the ownerless 'opn' resting state (Issue #695)
+
+**Symptom:** On an instance without an opening automation (Morning Opening unchecked —
+the "opens by hand" setup), toggling the Force Pause on and immediately off again pulls
+a closed cover all the way up. Trace: `t_force_pause_disabled` → BRANCH (8a) →
+`resume_state = 'opn'` → drive to the open position.
+
+**Cause:** The AV rule half-applied. `effective_state` returns `'opn'` for `bas ==
+'opn'` regardless of `is_opening_scheduled` (the flag only gates the VENT floor — #553),
+and since #673 the opening-time sync writer flips `bas` to `'opn'` daily even with
+Morning Opening unchecked. The #673 mirror added the closing-side ownership gate
+(`closing_target_owned`) to every automatic drive toward the close position — but the
+opening side got ownership gates only in the recovery reducer (`caught_up_opening_hold`,
+`manual_reset_recovery_hold`). The three reconcilers that map `effective_state`/
+`recovery_target` onto a drive — force-pause resume (8a), force-disable return (8) and
+the BRANCH-10 reset safety net — drove an `'opn'` target with no owning automation.
+
+**Fix:** Mirror of the closing-side clause at all three sites: the `'opn'` target
+actuates only when `is_opening_scheduled` or a live force-open owns it
+(`helper_state_force == 'opn'` in 8a/10 — `effective_state` maps `frc` first, so the
+force keeps its authority; in branch 8 the Last-Wins path already handles a live force).
+The force-disable return additionally lets `shading_ended_during_force` through: a
+shading end swallowed during the force keeps the shading's own restore-to-open
+authority, exactly like the (deliberately ungated) `'opn'` restore of the normal
+shading-end branch. State progress is untouched — the branches still run, still write
+the helper, only the movement is withheld (Invariant 15).
+
+**Deliberately NOT gated:** the shading-end `'opn'` restore and the window-closed
+return-to-open — those drives are owned by the automation that displaced the cover
+(shading / ventilation), not by the opening schedule.
+
+**Rule:** AV's rule, opening-side recurrence: the moment a state value can exist without
+its owning automation, EVERY drive consumer of that value needs an explicit ownership
+gate — auditing only the sites the original issue mentioned leaves the mirror sites to
+recur one by one. When adding such a gate, list every consumer of the target value and
+classify each as schedule-owned (gate) or displacer-owned (leave). Tests:
+`TestOpeningOwnershipGates` in `tests/test_blueprint_logic.py`.
 
 ---

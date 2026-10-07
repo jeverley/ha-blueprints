@@ -41,7 +41,7 @@ loading the reference first:
 | Anything that looks inconsistent and invites "harmonizing" (resident/override gates, pending preserve vs. discard, invalid sensor states, #558/#580) | [references/design-decisions.md](references/design-decisions.md) |
 | Availability gates, `t_recovery`, `automation_resumed`, the recovery gate — or adding any new gate that can stop a run | [references/recovery.md](references/recovery.md) (includes the orphan-audit checklist) |
 | Live opening/closing branch entry conditions, `base_gates`, `closing_position_hold`, the caught-up base flip — or adding any new gate to the live open/close branch | [references/recovery-parity.md](references/recovery-parity.md) (semantic contract, decision matrix, shared projections) |
-| Debugging a regression, changing global conditions / trigger `enabled:` / helper-JSON regexes / flow handoffs | [references/bug-patterns.md](references/bug-patterns.md) (patterns A–AT with cause and fix) |
+| Debugging a regression, changing global conditions / trigger `enabled:` / helper-JSON regexes / flow handoffs | [references/bug-patterns.md](references/bug-patterns.md) (patterns A–AZ with cause and fix) |
 
 The always-binding rules (the 15 invariants as one-liners, code style, quality
 gates, version bumping) are indexed in `.claude/CLAUDE.md`.
@@ -257,7 +257,7 @@ can `stop:` a run needs a `PRE_DISPATCH_DEFINITIONS` entry in the trace tools.
 - **Resident Sensor** — leaving: `leave_target` chain + VENT-tilted leaf; arriving: `arrive_target` + VENT-hold leaf
 - **Midnight Reset (23:55)** — clears `shd`/`pnd`/`man`
 - **Force enable/disable** — incl. `recovery_target` chain on disable; force pause resume
-- **Manual detection** — position/tilt → `man: 1` (never drives)
+- **Manual detection** — position/tilt → `man: 1` (never drives); opt-in `manual_schedule_adoption` (#671) additionally advances `bas` for an in-window manual open/close
 - **Override reset** — fixed time / timeout / in-position
 
 ---
@@ -296,7 +296,7 @@ Full rules: Invariant 12 in [references/invariants.md](references/invariants.md)
 
 ### Regressions
 Match the symptom against [references/bug-patterns.md](references/bug-patterns.md)
-(A–AT, each with symptom / cause / fix / derived rule) before writing a fix —
+(A–AZ, each with symptom / cause / fix / derived rule) before writing a fix —
 most "new" bugs are a documented pattern reaching a new code path.
 
 ---

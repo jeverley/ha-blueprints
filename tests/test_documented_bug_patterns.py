@@ -542,7 +542,7 @@ class TestPatternWTiltedClosingIdempotent:
         )
         gates = _find_variable_definition(_load_blueprint_yaml(), "state_gates")
         vnt_gate = str(gates["vnt"])
-        assert "force_allows_ventilate and (effective_state != 'vnt'" in vnt_gate, (
+        assert "force_allows_ventilate and not vent_raise_hold and (effective_state != 'vnt'" in vnt_gate, (
             "state_gates.vnt must be guarded by the in-ventilation check (#538)"
         )
         assert "not in_ventilate_position" in vnt_gate, (
@@ -632,15 +632,36 @@ class TestPatternASBlockedEffectsKeepStateCurrent:
         return _find_branch_by_alias(_load_blueprint_yaml(), RESET_BRANCH_ALIAS)
 
     def test_manual_detection_only_records_the_override(self):
+        # The #671 schedule adoption is the one documented opt-in exception:
+        # the opened/closed branches may additionally advance `bas` (with its
+        # timestamp) when `adopt_schedule` is true — nothing else, ever.
+        import ast
+
         manual = _find_branch_by_alias(
             _load_blueprint_yaml(), "Checking for manual position changes"
         )
         choose = next(step for step in manual["sequence"] if "choose" in step)
         forbidden = {"bas", "shd", "pnd", "win", "frc", "res"}
+        env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+
+        def _rendered(template: str, **ctx) -> dict:
+            return ast.literal_eval(env.from_string(template).render(**ctx).strip())
+
         for candidate in choose["choose"]:
             update = candidate["sequence"][0]["variables"]["update_values"]
-            assert update["man"] == 1
-            assert forbidden.isdisjoint(update)
+            if isinstance(update, str):
+                off = _rendered(update, adopt_schedule=False)
+                assert off["man"] == 1
+                assert forbidden.isdisjoint(off)
+                on = _rendered(update, adopt_schedule=True)
+                assert on["man"] == 1
+                assert (forbidden - {"bas"}).isdisjoint(on), (
+                    "adoption may only add `bas`, never other background state"
+                )
+                assert "bas" in on and set(on["ts"]) <= {"man", "opn", "cls"}
+            else:
+                assert update["man"] == 1
+                assert forbidden.isdisjoint(update)
         update = choose["default"][0]["variables"]["update_values"]
         assert update["man"] == 1 and forbidden.isdisjoint(update)
 
@@ -717,6 +738,15 @@ class TestPatternASBlockedEffectsKeepStateCurrent:
         update = _find_variable_definition(branch, "update_values")
         assert update == {"man": 0}
 
+    def test_reset_branch_requires_an_active_override(self, branch):
+        # A live manual_reset_event (man == 1) is always claimed and stopped by
+        # the pre-dispatch recovery reducer first. Without this gate, a reset
+        # trigger firing with man == 0 (e.g. right after the midnight reset
+        # cleared it) would fall through here and drive unconditionally,
+        # bypassing auto_recover_after_manual_reset entirely.
+        conditions = str(branch["conditions"])
+        assert "helper_state_manual" in conditions
+
     def test_force_pause_resume_explicitly_takes_control_from_manual(self):
         resume = _find_branch_by_alias(
             _load_blueprint_yaml(), "Drive to target position after force pause disabled"
@@ -777,10 +807,14 @@ class TestPatternASBlockedEffectsKeepStateCurrent:
         closed_common = dict(
             is_paused=False,
             return_target="opn",
+            return_condition_ok=True,
             prevent_flags={"opening_after_ventilation_end": False},
             force_allows_shade=True,
             force_allows_open=True,
             force_allows_close=True,
+            is_closing_scheduled=True,
+            resident_blocks_open=False,
+            in_ventilate_position=False,
         )
         # The destination is open, but only the contact-ventilation policy owns
         # this event; no opening policy is required or even provided here.
@@ -1320,6 +1354,11 @@ def _eval_ha_condition(env, cond, variables) -> bool:
             return any(_eval_ha_condition(env, c, variables) for c in cond["or"])
         if "and" in cond:
             return all(_eval_ha_condition(env, c, variables) for c in cond["and"])
+        if "condition" in cond:
+            # `condition: !input <name>` — the loader resolves the tag to the
+            # input name; tests supply the outcome via variables["input_conditions"]
+            # (default: the user condition passes, like an empty condition list).
+            return bool(variables.get("input_conditions", {}).get(cond["condition"], True))
     raise AssertionError(f"unsupported condition node: {cond!r}")
 
 
@@ -1706,3 +1745,210 @@ class TestPatternATVentHoldSurvivesInvalidOpenedContact:
             assert "not window_opened_now" in flat, (
                 f"{alias!r} must gate on 'not window_opened_now' (Pattern AT)"
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug Pattern AY: the opening handler handed the opening over to the shading
+# execution ("Opening: Shading warranted, arm pending" / "Opening skipped:
+# Shading start pending") although the user's additional shading-start
+# condition was false. The execution is the only consumer of that condition;
+# while it is false it can only retry and finally abort — it never opens the
+# cover. Independent-temperature mode makes shading "warranted" from dawn on
+# whenever the forecast exceeds the threshold, so a seasonally switched-off
+# shading (the documented use of the condition) kept the cover closed all day
+# (trace report, 2026-09-29: input_boolean off, forecast 26.9 °C ≥ 26 °C).
+# Both handoff branches now gate on the same anchored condition as the
+# execution, and the abort path reconciles the open target as a safety net.
+# ─────────────────────────────────────────────────────────────────────────────
+
+AY_EXECUTION_ALIAS = "Shading start execution"
+AY_GATE_INPUT = "auto_shading_start_condition"
+
+
+def _ay_variables(**overrides) -> dict:
+    base = _ag_variables(
+        effective_state="opn",
+        is_ventilation_enabled=False,
+        contact_window_opened=[],
+        contact_window_tilted=[],
+    )
+    base.update(overrides)
+    return base
+
+
+def _shading_start_abort_default() -> list:
+    """The `default:` of the shared retry routine (&shading_start_retry) inside
+    the execution branch's blocked-by-condition else path."""
+    branch = _find_branch_by_alias(_load_blueprint_yaml(), AY_EXECUTION_ALIAS)
+    assert branch is not None
+    step = branch["sequence"][0]
+    retry = [s for s in step["else"] if isinstance(s, dict) and "choose" in s]
+    assert len(retry) == 1, "expected exactly one retry choose in the else path"
+    return retry[0]["default"]
+
+
+class TestPatternAYShadingGateOffMustNotHoldTheOpening:
+    """A false shading-start condition must never turn the opening into a
+    shading handoff — neither by arming a pending nor by deferring to one."""
+
+    def test_gate_off_without_pending_opens_normally(self):
+        chosen = _select_opening_branch(
+            {}, _ay_variables(input_conditions={AY_GATE_INPUT: False})
+        )
+        assert chosen == AG_NORMAL_ALIAS
+
+    def test_gate_off_with_pending_opens_normally(self):
+        # The reported case: pending_7 armed at dawn, condition entity off
+        chosen = _select_opening_branch(
+            {},
+            _ay_variables(
+                helper_state_pending_start=True,
+                input_conditions={AY_GATE_INPUT: False},
+            ),
+        )
+        assert chosen == AG_NORMAL_ALIAS
+
+    def test_gate_on_without_pending_still_arms(self):
+        chosen = _select_opening_branch(
+            {}, _ay_variables(input_conditions={AY_GATE_INPUT: True})
+        )
+        assert chosen == AG_ARM_ALIAS
+
+    def test_gate_on_with_pending_still_defers(self):
+        chosen = _select_opening_branch(
+            {},
+            _ay_variables(
+                helper_state_pending_start=True,
+                input_conditions={AY_GATE_INPUT: True},
+            ),
+        )
+        assert chosen == AG_DEFER_ALIAS
+
+    def test_gate_unset_keeps_previous_behavior(self):
+        # No opinion supplied → the user condition passes (empty condition list)
+        assert _select_opening_branch({}, _ay_variables()) == AG_ARM_ALIAS
+
+    @pytest.mark.parametrize("alias", [AG_DEFER_ALIAS, AG_ARM_ALIAS, AY_EXECUTION_ALIAS])
+    def test_same_user_condition_gates_handoff_and_execution(self, alias):
+        blueprint = _load_blueprint_yaml()
+        branch = _find_branch_by_alias(blueprint, alias)
+        assert branch is not None, f"branch not found: {alias!r}"
+        if alias == AY_EXECUTION_ALIAS:
+            conds = branch["sequence"][0]["if"]
+        else:
+            conds = branch["conditions"]
+        assert {"condition": AY_GATE_INPUT} in conds, (
+            f"{alias!r} must evaluate the user's shading-start condition "
+            "(shared *auto_shading_start_condition_check anchor, Pattern AY)"
+        )
+
+    def test_anchor_is_defined_before_its_first_alias_use(self):
+        # YAML resolves anchors in document order: the definition must sit in
+        # the opening handler (first consumer), the execution uses the alias.
+        text = _blueprint_text()
+        definition = text.index("&auto_shading_start_condition_check")
+        first_alias = text.index("*auto_shading_start_condition_check")
+        assert definition < first_alias
+        assert text.count("&auto_shading_start_condition_check") == 1
+        assert text.index(AG_ARM_ALIAS) < definition < text.index(AG_DEFER_ALIAS)
+
+
+class TestPatternAYAbortReconcilesTheOpening:
+    """Safety net: when a shading-start pending aborts, the released cover must
+    follow the current cascade — an 'opn' target behind the normal-opening
+    gates is driven open instead of staying wherever the handoff left it."""
+
+    @pytest.fixture(scope="class")
+    def abort_default(self):
+        return _shading_start_abort_default()
+
+    @pytest.fixture(scope="class")
+    def abort_variables(self, abort_default):
+        # The user's opening condition is evaluated first (Bug Pattern AZ,
+        # #698); the reconciliation variables are the first variables step
+        variables = next(s["variables"] for s in abort_default
+                         if isinstance(s, dict) and "variables" in s)
+        assert "will_drive" in variables and "drive_plan" in variables
+        return variables
+
+    def test_the_opening_condition_is_evaluated_before_the_reconciliation(self, abort_default):
+        gate = abort_default[0]
+        assert gate["if"] == [{"condition": "auto_up_condition"}]
+        assert gate["then"][0]["variables"]["abort_up_condition_ok"] is True
+        assert gate["else"][0]["variables"]["abort_up_condition_ok"] is False
+
+    def test_drive_plan_targets_the_open_position(self, abort_variables):
+        # Reads the reconciler projection (state_targets.opn) like every other
+        # "drive to state X" leaf — never a raw open_position (lockout swap rule)
+        plan = abort_variables["drive_plan"]
+        assert "state_targets.opn.action_set" in str(plan["action_set"])
+        assert "state_targets.opn.target" in str(plan["target"])
+        assert "state_targets.opn.target_tilt" in str(plan["target_tilt"])
+        assert plan["run"].strip() == "{{ will_drive }}"
+
+    def test_will_drive_mirrors_the_opening_entry_and_drive_gates(self, abort_variables):
+        gate = str(abort_variables["will_drive"])
+        for token in (
+            "effective_state == 'opn'",
+            "not in_open_position",
+            "not is_paused",
+            "is_up_enabled",
+            "base_gates.opening.override_ok",
+            "base_gates.opening.once_ok",
+            "base_gates.opening.schedule_ok",
+            "resident_flags.allow_open",
+            "force_allows_open",
+        ):
+            assert token in gate, f"abort will_drive must gate on {token}"
+
+    def test_pending_terminates_without_touching_manual(self, abort_default, abort_variables):
+        uv = abort_variables["update_values"]
+        assert uv.get("pnd") == "non" and uv.get("shd") == 0
+        assert uv.get("ts", {}).get("due") == 0 and uv.get("ts", {}).get("arm") == 0
+        assert "man" not in uv  # Invariant 7: the dispatch anchor owns man:0
+        assert "input_text.set_value" in str(abort_default)
+        assert "stop" in abort_default[-1]
+
+    @staticmethod
+    def _render_will_drive(abort_variables, **overrides) -> bool:
+        from conftest import eval_condition
+
+        variables = {
+            "effective_state": "opn",
+            "in_open_position": False,
+            "is_paused": False,
+            "is_up_enabled": True,
+            "abort_up_condition_ok": True,
+            "base_gates": {
+                "opening": {"override_ok": True, "once_ok": True, "schedule_ok": True}
+            },
+            "resident_flags": {"allow_open": True},
+            "force_allows_open": True,
+        }
+        variables.update(overrides)
+        env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+        return eval_condition(env, str(abort_variables["will_drive"]), variables)
+
+    def test_reported_scenario_opens(self, abort_variables):
+        # Trace: bas=opn, cover at 0 %, no blockers → the abort must open
+        assert self._render_will_drive(abort_variables) is True
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"in_open_position": True},
+            {"effective_state": "vnt"},
+            {"effective_state": "shd"},
+            {"effective_state": "lock"},
+            {"is_up_enabled": False},
+            {"abort_up_condition_ok": False},   # Bug Pattern AZ (#698)
+            {"is_paused": True},
+            {"force_allows_open": False},
+            {"resident_flags": {"allow_open": False}},
+            {"base_gates": {"opening": {"override_ok": False, "once_ok": True, "schedule_ok": True}}},
+            {"base_gates": {"opening": {"override_ok": True, "once_ok": False, "schedule_ok": True}}},
+            {"base_gates": {"opening": {"override_ok": True, "once_ok": True, "schedule_ok": False}}},
+        ],
+    )
+    def test_blockers_and_foreign_targets_stand_down(self, abort_variables, overrides):
+        assert self._render_will_drive(abort_variables, **overrides) is False

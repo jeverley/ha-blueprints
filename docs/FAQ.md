@@ -9,15 +9,19 @@ This comprehensive FAQ covers the most common questions about Cover Control Auto
 
 1. [General Questions](#general-questions)
 2. [Installation & Requirements](#installation--requirements)
+   - [Can I define CCA automations in YAML packages instead of automations.yaml?](#q-can-i-define-cca-automations-in-yaml-packages-instead-of-automationsyaml)
 3. [Configuration Basics](#configuration-basics)
 4. [Time & Schedule Control](#time--schedule-control)
 5. [Position Settings](#position-settings)
 6. [Cover Types (Blinds vs. Awnings)](#cover-types-blinds-vs-awnings)
+   - [How do I retract my awning in the evening based on sun elevation?](#q-how-do-i-retract-my-awning-in-the-evening-based-on-sun-elevation)
 7. [Sun Shading & Sun Protection](#sun-shading--sun-protection)
+   - [Why do the slats keep closing in the evening after the sun has left the azimuth range?](#q-why-do-the-slats-keep-closing-in-the-evening-after-the-sun-has-left-the-azimuth-range)
 8. [Ventilation & Contact Sensors](#ventilation--contact-sensors)
    - [Which window sensor has higher priority — opened or tilted?](#q-which-window-sensor-has-higher-priority--opened-or-tilted)
 9. [Manual Override & Detection](#manual-override--detection)
 10. [Resident Mode](#resident-mode)
+    - [How do I set up CCA for a vacation (nobody home)?](#q-how-do-i-set-up-cca-for-a-vacation-nobody-home)
 11. [Force Functions & Emergency Control](#force-functions--emergency-control)
     - [What is Force Pause and how is it different from a global condition?](#q-what-is-force-pause-and-how-is-it-different-from-a-global-condition)
 12. [Cover Status Helper](#cover-status-helper)
@@ -133,6 +137,21 @@ My clear recommendation is to create **one automation for each cover**.
 2. Go to Settings → Automations & Scenes → Blueprints
 3. The blueprint should appear automatically
 4. Create a new automation using the CCA blueprint
+
+---
+
+### Q: Can I define CCA automations in YAML packages instead of automations.yaml?
+
+**A:** The automation will **run** fine from a package, but **do not open it in the UI editor** — the page will load forever and Home Assistant becomes very unresponsive. Keep CCA automations in `automations.yaml` (or create them via the UI) instead.
+
+**Why this happens** (Home Assistant behavior, not a CCA bug):
+- The UI editor can only edit automations stored in `automations.yaml`. For any other location (packages, `!include`d files), it falls back to a read-only view based on the entity's `raw_config`.
+- For blueprint automations, Home Assistant stores `raw_config` as the **fully expanded** blueprint — not your small `use_blueprint:` block.
+- Since the expanded config no longer contains `use_blueprint`, the frontend renders the manual visual editor for the entire expanded automation instead of the compact blueprint input form.
+
+With small blueprints this is unnoticeable, but CCA expands to thousands of YAML lines with deeply nested logic — rendering and validating all of that freezes the page.
+
+**Recommendation:** Store CCA automations in `automations.yaml`. If you want to organize many automations, use labels, categories, or areas in the UI — packages would disable UI editing for automations anyway.
 
 ---
 
@@ -512,6 +531,33 @@ Close Position: 100%  # Fully extended
 
 ---
 
+### Q: How do I retract my awning in the evening based on sun elevation?
+
+**A:** Not with *Evening Closing* — closing always drives to the **Close Position**, and for an awning that means *extending* it. Enabling ☀️ Sun Elevation Control together with 🔻 Evening Closing therefore extends the awning around sunset instead of retracting it. There is no combination of the opening/closing options that maps a falling sun to the Open Position — that job belongs to the **shading end**:
+
+**Recommended setup (pure sun-driven awning):**
+
+1. In *What should CCA control?* enable only **🥵 Sun Protection / Shading**. Leave Morning Opening, Evening Closing and Time Control unchecked — the base state then stays "open" (= retracted) permanently, and shading is the only thing that ever extends the awning.
+2. Configure the shading start conditions as usual (azimuth, elevation, brightness, …).
+3. Set the **Sun Shading Elevation minimum** to your evening threshold (e.g. `10°`). Once the sun drops below it, the shading END triggers fire and the awning returns to the Open Position — retracted, purely elevation-based, no fixed time involved.
+
+If shading ended earlier for another reason (brightness, azimuth out of range), the awning is already retracted by then — there is nothing left to do in the evening.
+
+**Guaranteed retract, independent of everything (recommended for wind-sensitive awnings):**
+
+A manually extended awning is protected by the manual override, so the shading end will not touch it. If the awning must be retracted below a certain elevation *no matter what*, use the **Force Open** entity with a template sensor:
+
+```yaml
+template:
+  - binary_sensor:
+      - name: "Awning night retract"
+        state: "{{ state_attr('sun.sun', 'elevation') | float(0) < 10 }}"
+```
+
+Configure it as *Force Opening* (`auto_up_force`). Force sits at the top of the priority cascade: when the sensor turns `on`, the awning retracts — regardless of shading state or manual override — and stays retracted all night. In the morning the sensor turns `off` and (with force recovery enabled) CCA resumes normal control.
+
+---
+
 ### Q: What if I have both blinds and awnings?
 
 **A:** Create separate automations:
@@ -615,6 +661,7 @@ Result: Sun in range + at least one other condition
 **Shading Start Pending:**
 - Initial conditions met
 - Waiting for stable readings (waiting time)
+- The brightness start condition measures the waiting time inside the trigger: the value must stay above the start threshold without interruption, a dip in between restarts the wait — the pending then executes immediately
 - Periodic re-checking if configured
 - Will execute when conditions remain stable
 
@@ -622,6 +669,7 @@ Result: Sun in range + at least one other condition
 - End conditions detected
 - Waiting for stable readings (waiting time)
 - Ensures changes aren't temporary
+- Sensor-based end conditions (brightness, temperature, forecast, weather, custom sensor) measure the waiting time inside the trigger: the value must stay invalid without interruption, a recovery in between restarts the wait — the pending then executes immediately
 - Will execute when conditions remain invalid
 
 **Why pending?**
@@ -761,6 +809,29 @@ Forecast Temperature Value: 30°C
 - Can check weather conditions
 - More integration options
 - Standard method
+
+---
+
+### Q: Why do the slats keep closing in the evening after the sun has left the azimuth range?
+
+**A:** Because the sun shading is still active. The elevation-based tilt stages (*"🥵 Sun Shading Tilt Position 1–3"*) are re-applied only while the status helper shows `"shd":1`. When the sun leaves the azimuth range but the shading does not end, the tilt keeps following the decreasing sun elevation towards sunset — so the slats close more and more.
+
+The shading does not end in this situation when:
+- "Sun Azimuth" is **not** part of your END conditions, or
+- "Sun Azimuth" sits in the END **AND** group together with a condition that is still valid (e.g. temperature or brightness).
+
+**Solution:** Put "Sun Azimuth" into the *"🌥️ Shading END - Optional Conditions (OR)"* group. The shading then ends as soon as the sun leaves the range and the tilt tracking stops with it. With *"☀️ Stay shaded: Don't open cover when sun shading ends"* enabled, the cover keeps its position and only the slats move to the *"🔼 Open Tilt Position"* — heat protection stays, the view outside is back.
+
+**Alternative (freeze the slats):** Add a template condition to *"🥵 Additional Condition For Sun Shading Tilt"* that checks the azimuth against your range, e.g.:
+
+```yaml
+condition: template
+value_template: >-
+  {{ state_attr('sun.sun', 'azimuth') | float(0) > 120 and
+     state_attr('sun.sun', 'azimuth') | float(0) < 250 }}
+```
+
+The tilt stages are skipped while the condition is false, so the slats keep their last angle. The shading remains logically active, so a recovery run (e.g. after a Home Assistant restart) re-applies the tilt calculated for the current elevation. Prefer the END-condition solution unless you explicitly want the slats to stay where they are.
 
 ---
 
@@ -986,7 +1057,7 @@ Block automatic sun shading during Manual Override
 - ☑ "Block automatic opening" → The scheduled opening does not move it while Manual Override is active
 - ☐ "Block automatic sun shading" → Sun shading may still move it if the shading conditions become valid
 
-CCA still tracks both decisions internally. If the scheduled opening or sun shading remains the current target when Manual Override resets, CCA reconciles that target immediately; an intent that already ended is not replayed.
+CCA still tracks both decisions internally. If the scheduled opening or sun shading remains the current target when Manual Override resets, CCA reconciles that target immediately — provided **Return to Target State After Manual Override Reset** is enabled (default: disabled, the reset then only clears the override and the cover keeps its position until the next event after the reset). An intent that already ended is not replayed.
 
 ---
 
@@ -1140,6 +1211,120 @@ Result: Cover stays closed (correct!)
 ☑ Allow opening the cover when resident is still present
 ```
 Enables automatic opening even if resident sensor is "on"
+
+---
+
+### Q: How do I set up CCA for a vacation (nobody home)?
+
+**A:** There are two proven approaches — pick one, or mix them per room:
+
+**Option 1: Vacation boolean as resident sensor (keeps covers closed)**
+
+Vacation is, from CCA's point of view, just a very long sleep. Create one
+`input_boolean.vacation_mode` and select it as the **Resident Sensor** in every
+CCA automation that should stay closed:
+
+```yaml
+Resident Sensor: input_boolean.vacation_mode
+
+Resident Configuration:
+☑ Enable automatic closing when resident goes to sleep (immediate)
+☑ Enable automatic opening when resident wakes up
+☐ Allow opening the cover when resident is still present
+☐ Allow sun protection when resident is still present
+☐ Allow ventilation when resident is still present
+```
+
+**Behavior:**
+- Boolean **on** → covers close immediately and stay closed; automatic opening
+  is blocked as long as the boolean is on (leave the three "Allow …" options
+  unchecked, otherwise you punch holes into the vacation close).
+- **Force functions keep working:** a bad-weather / storm **Force Open** has the
+  highest priority in the cascade and overrides the vacation close. Enable
+  **"🔙 Return to Target State After Force Disable"** so the covers close again
+  automatically once the force entity switches off
+  (see [Force Functions](handbook/force#auto_recover_after_force)).
+- Boolean **off** (back home) → the normal schedule takes over again; with
+  "opening enabled" the covers open as soon as the regular time, brightness and
+  sun conditions are met.
+
+**Option 2: Additional Conditions on a vacation boolean (per-cover behavior / presence simulation)**
+
+If all covers stay closed for two weeks, the house looks empty. With the
+per-action [Additional Conditions](handbook/conditions) you can decide **per
+cover** what vacation means — some stay closed, others keep the normal
+morning/evening rhythm as a presence simulation:
+
+```yaml
+# Covers that must stay closed during vacation (e.g. terrace door):
+Additional Condition For Opening The Cover:
+  condition: state
+  entity_id: input_boolean.vacation_mode
+  state: 'off'
+
+# Covers that should keep moving (e.g. living room):
+# → leave the conditions empty; the normal schedule continues.
+```
+
+The inverse also works: a condition on `state: 'on'` for the **closing** side
+lets a cover close during vacation that normally stays open. Unlike the global
+condition, the per-action conditions only suppress that one movement — the
+background state tracking stays intact (since `2026.09.29 V2`,
+[#698](https://github.com/hvorragend/ha-blueprints/issues/698)).
+
+Note for covers with **sun shading** configured: the opening condition only
+withholds movements *toward the open position*. Because the internal day state
+still switches to "open" at the opening time, a sun shading that starts on a
+still-closed cover raises it to the shading position, and at the shading end
+the cover stays there (the opening is withheld). If such a cover must not move
+at all during vacation, put the same vacation condition into **🥵 Additional
+Condition When Activating Sun Shading** as well — or use Option 1 (Force Close).
+
+**Real-world example — selective vacation closing on a door cover:**
+
+A utility-room door cover that opens at a fixed time every morning and normally
+stays open all day. Only during vacation does it close in the evening — with
+lockout protection so it never closes while the door is open:
+
+```yaml
+use_blueprint:
+  path: hvorragend/cover_control_automation.yaml
+  input:
+    blind: cover.utility_room_door
+    cover_status_options: cover_helper_enabled
+    cover_status_helper: input_text.cover_status_utility_room_door
+    auto_options:
+      - auto_up_enabled
+      - auto_down_enabled
+      - auto_ventilate_enabled   # includes the lockout protection
+      - time_control_enabled
+    # Fixed schedule, no brightness/sun sensors:
+    time_up_early: '07:00:00'
+    time_up_late: '07:00:00'
+    time_down_early: '21:45:00'
+    time_down_late: '21:45:00'
+    # Evening closing only runs while the vacation boolean is on:
+    auto_down_condition:
+      - condition: state
+        entity_id: input_boolean.vacation_mode
+        state: 'on'
+    # Door contact → lockout: never close (and drive open) while the door is open.
+    # Leave the tilted contact empty on a door — lockout only, no ventilation position.
+    contact_window_opened: binary_sensor.door_contact_utility_room
+```
+
+Rest of the year the door cover opens at 07:00 and stays open; with
+`input_boolean.vacation_mode` on it also closes at 21:45 every evening.
+Timing note: the condition is only evaluated when the closing trigger fires —
+if you switch the vacation boolean on **after** the closing time, the first
+automatic close happens the next evening, so enable it before you leave (or
+close that cover once by hand).
+
+**Also worth knowing:** for a completely different vacation *configuration*
+(other times, other positions), run a second CCA automation for the same cover
+with its own status helper and switch between them — a vacation calendar can do
+the switching for you (see
+[Only run this automation while this switch is on](handbook/features#instance_active)).
 
 ---
 
@@ -1455,9 +1640,10 @@ Sharing breaks functionality completely
 - Invalid JSON breaks automation
 - Inconsistent state causes unpredictable behavior
 - CCA may overwrite immediately
+- An edit is not an event: clearing `man` by hand does not move the cover. CCA only reconciles the current target on its own reset events (timeout, fixed time, reset position — with *Return to Target State After Manual Override Reset* enabled), so a sun shading that was blocked by the override stays recorded as active without a repeated start
 
 **Better alternatives:**
-- Use reset manual override function
+- Use reset manual override function (enable *Return to Target State After Manual Override Reset* if the cover should move right away)
 - Wait for midnight reset
 - Restart automation
 
@@ -1551,7 +1737,7 @@ What "caught up" means:
 
 **When a battery sensor stays silent:** window and presence sensors only report when something changes. After a restart of your *hub* they can be without a state for hours. That is expected — CCA continues with the last known values. Only the one case above (window last known open/tilted) makes it wait, and that resolves the moment you next move the window.
 
-**Can I prevent CCA from lowering below ventilation position if the window contact state is unknown?** By default, an unreadable **tilted** contact reads as closed; an unreadable **opened** contact reads as not open. Both match the last known truth in most cases, but neither is confirmed. Enable **"Limit how far cover lowers when a contact sensor state is unreadable"** ([💨 Ventilation Configuration](handbook/contacts#auto_ventilate_options)) to change both: tilted then always resolves as tilted (cover never closes past the ventilation position); opened then withholds the close/shading instead, never driving the cover. The opened contact's proactive open-drive, its LOCKOUT role, and the "hold and wait" behavior above are unaffected, since assuming "open" there could be genuinely wrong. Off by default.
+**Can I prevent CCA from lowering below ventilation position if the window contact state is unknown?** By default, an unreadable **tilted** contact reads as closed; an unreadable **opened** contact reads as not open. Both match the last known truth in most cases, but neither is confirmed. Enable **"Limit how far cover lowers when a contact sensor state is unreadable"** ([💨 Ventilation Configuration](handbook/contacts#auto_ventilate_options)) to change both: tilted then always resolves as tilted (cover never closes past the ventilation position, but a cover that already sits below it, e.g. closed by hand, is not raised on an unconfirmed reading); opened then withholds the close/shading instead, never driving the cover. The opened contact's proactive open-drive, its LOCKOUT role, and the "hold and wait" behavior above are unaffected, since assuming "open" there could be genuinely wrong. Off by default.
 
 ---
 
@@ -1947,7 +2133,9 @@ Additional Condition For Opening:
   entity_id: input_boolean.vacation_mode
   state: 'off'
 
-Result: Covers stay closed during vacation
+Result: No automatic opening during vacation (the day state still advances,
+        so a cover opened by hand is treated as open; sun shading keeps its
+        own condition — see the vacation entry above)
 ```
 
 **Party Mode:**
@@ -2168,7 +2356,7 @@ Disables default cover commands for custom integrations
 | `t_shading_start_pending_1` - `_7` | Shading Pending | Checks azimuth/elevation, brightness, temp1/2, weather, forecast |
 | `t_shading_start_execution` | Shading Executed | Pending time elapsed, conditions met |
 | `t_shading_tilt_1` - `_4` | Shading Tilt | Elevation-based tilt adjustment |
-| `t_shading_end_pending_1` - `_6` | Shading End Pending | End conditions detected |
+| `t_shading_end_pending_1` - `_8` | Shading End Pending | End conditions detected (sensor triggers only fire after the end waiting time has held without interruption) |
 | `t_shading_end_execution` | Shading End Executed | End pending time elapsed |
 | `t_shading_reset` | Shading Reset | Midnight reset of shading status |
 | `t_manual_position` | Manual Position Detection | Position changed manually |

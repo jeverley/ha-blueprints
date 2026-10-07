@@ -1348,7 +1348,9 @@ WIN_TILT_DRIVE_BRANCH = {
         # OR-block flattened into one Jinja expression
         "{{ position_comparisons.current_below_ventilate"
         " or (is_cover_tilt_enabled_and_possible"
-        "     and (position_comparisons.current_below_ventilate or current_position == ventilate_position))"
+        "     and (position_comparisons.current_below_ventilate or current_position == ventilate_position"
+        "          or ((current_position - ventilate_position) | abs <= position_tolerance"
+        "              and not in_ventilate_position)))"
         " or (ventilation_flags.if_lower_enabled and (position_comparisons.current_above_ventilate or current_position == ventilate_position))"
         " or (helper_state_window == 'opn' and position_comparisons.current_above_ventilate)"
         " or (position_comparisons.current_above_ventilate and effective_state == 'cls') }}",
@@ -1383,6 +1385,7 @@ def _make_tilt_vars(
     is_cover_tilt_enabled_and_possible: bool = False,
     current_position: int = 100,
     ventilate_position: int = 50,
+    position_tolerance: int = 3,
     current_tilt_position: int = 100,
     ventilate_tilt_position: int = 50,
     effective_state: str = "vnt",
@@ -1411,6 +1414,7 @@ def _make_tilt_vars(
         "is_cover_tilt_enabled_and_possible": is_cover_tilt_enabled_and_possible,
         "current_position": current_position,
         "ventilate_position": ventilate_position,
+        "position_tolerance": position_tolerance,
         "current_tilt_position": current_tilt_position,
         "ventilate_tilt_position": ventilate_tilt_position,
         "effective_state": effective_state,
@@ -1561,6 +1565,85 @@ class TestKeepOpenOnFullToTilt:
         assert branch == "partial_ventilation_drive", (
             "A freshly tilted window must drive a tilt cover at the ventilate "
             "position to the ventilate tilt, even from a more-open slat angle."
+        )
+
+    def test_issue_667_near_vent_position_tilt_off_angle_drives(self):
+        """
+        Issue #667: tilt cover resting NEAR (not exactly at) the ventilate
+        position — venetian setups share one cover position for close/shading/
+        ventilate and the motor reports e.g. 1% instead of 0% (#538). With the
+        slats at the shading angle, tilting the window must still drive to the
+        ventilate target. Before the fix the tilt alternative required exact
+        position equality, so NO branch matched: no tilt drive and no win sync.
+        """
+        env = make_jinja_env()
+        variables = _make_tilt_vars(
+            helper_state_window="cls",
+            is_cover_tilt_enabled_and_possible=True,
+            current_position=1,
+            ventilate_position=0,
+            position_tolerance=3,
+            current_above_ventilate=True,  # raw comparison: 1 > 0
+            current_tilt_position=30,      # slats at shading angle
+            ventilate_tilt_position=70,
+            in_ventilate_position=False,   # tilt outside tilt_position_tolerance
+            effective_state="vnt",
+        )
+        branch = first_matching_branch(env, WIN_TILT_BRANCHES, variables)
+        assert branch == "partial_ventilation_drive", (
+            "A tilt cover within position_tolerance of the ventilate position "
+            "with the slats off the ventilate angle must drive (issue #667)."
+        )
+
+    def test_issue_667_near_vent_position_fully_in_position_syncs_only(self):
+        """
+        Guard for the #667 fix: the same near-position case with the slats
+        already within tilt tolerance is fully in the ventilate position —
+        it must keep taking the sync-only branch (no drive, no man clear),
+        exactly as before the fix.
+        """
+        env = make_jinja_env()
+        variables = _make_tilt_vars(
+            helper_state_window="cls",
+            is_cover_tilt_enabled_and_possible=True,
+            current_position=1,
+            ventilate_position=0,
+            position_tolerance=3,
+            current_above_ventilate=True,
+            current_tilt_position=70,
+            ventilate_tilt_position=70,
+            in_ventilate_position=True,
+            effective_state="vnt",
+        )
+        branch = first_matching_branch(env, WIN_TILT_BRANCHES, variables)
+        assert branch == "no_drive_helper_only", (
+            "Fully in the ventilate position (incl. tilt) must stay a helper "
+            "sync, not a drive (#667 must not shadow the sync branch)."
+        )
+
+    def test_issue_667_beyond_tolerance_unchanged(self):
+        """
+        Guard for the #667 fix: a tilt cover clearly ABOVE the ventilate
+        position (outside position_tolerance) keeps the pre-fix behaviour —
+        VENT is a floor, lowering needs ventilation_if_lower_enabled.
+        """
+        env = make_jinja_env()
+        variables = _make_tilt_vars(
+            helper_state_window="cls",
+            is_cover_tilt_enabled_and_possible=True,
+            current_position=40,
+            ventilate_position=0,
+            position_tolerance=3,
+            current_above_ventilate=True,
+            current_tilt_position=30,
+            ventilate_tilt_position=70,
+            in_ventilate_position=False,
+            effective_state="vnt",
+        )
+        branch = first_matching_branch(env, WIN_TILT_BRANCHES, variables)
+        assert branch is None, (
+            "Outside position_tolerance the tolerance alternative must not "
+            "fire — the VENT floor semantics stay unchanged."
         )
 
 
@@ -2280,6 +2363,90 @@ class TestForcePauseDisabledHasBackgroundOpen:
         assert targets is not None, "state_targets projection missing"
         assert targets["opn"]["action_set"] == "up"
         assert "open_position" in str(targets["opn"]["target"])
+
+
+class TestOpeningOwnershipGates:
+    """
+    #695 (Bug Pattern AY, opening-side recurrence of AV): an 'opn' that only
+    exists as the bas init default or the #673 state-only schedule sync has no
+    owning automation and must never be actuated by a reconciliation. The
+    three reconcilers that project effective_state / recovery_target onto a
+    drive gate their 'opn' target on is_opening_scheduled, with a live
+    force-open keeping its own authority — mirroring the closing-side
+    closing_target_owned clause they already carry.
+    """
+
+    _OPN_CLAUSE = "or is_opening_scheduled or"
+
+    def _handler(self, blueprint, alias):
+        handler = _find_branch_by_alias(blueprint, alias)
+        assert handler is not None, f"handler {alias!r} missing"
+        return handler
+
+    def test_force_pause_resume_gates_the_unowned_opn(self):
+        blueprint = _load_blueprint_yaml(BLUEPRINT_PATH)
+        handler = self._handler(
+            blueprint, "Drive to target position after force pause disabled")
+        will_drive = str(_find_variable_definition(handler, "will_drive"))
+        assert "resume_state != 'opn'" in will_drive
+        assert self._OPN_CLAUSE in will_drive
+        assert "helper_state_force == 'opn'" in will_drive, (
+            "a live force-open mapped to 'opn' by effective_state must keep "
+            "its authority"
+        )
+        # The closing-side clause (#673 mirror) must survive next to it.
+        assert "closing_target_owned" in will_drive
+
+    def test_force_pause_resume_log_line_matches_the_hold(self):
+        blueprint = _load_blueprint_yaml(BLUEPRINT_PATH)
+        handler = self._handler(
+            blueprint, "Drive to target position after force pause disabled")
+        log_user = str(_find_variable_definition(handler, "log_user"))
+        assert "stays where it is" in log_user, (
+            "a withheld resume must not log as if a movement happened"
+        )
+
+    def test_force_disable_return_gates_the_unowned_opn(self):
+        blueprint = _load_blueprint_yaml(BLUEPRINT_PATH)
+        handler = self._handler(
+            blueprint, "Force disabled recovery: drive to background target")
+        will_drive = str(_find_variable_definition(handler, "will_drive"))
+        assert "is_opening_scheduled" in will_drive
+        assert "shading_ended_during_force" in will_drive, (
+            "a shading end swallowed during the force keeps the shading's "
+            "restore-to-open authority (mirrors the ungated shading-end 'opn')"
+        )
+        assert "closing_target_owned" in will_drive
+
+    def test_reset_safety_net_gates_the_unowned_opn(self):
+        blueprint = _load_blueprint_yaml(BLUEPRINT_PATH)
+        handler = self._handler(blueprint, "Reset manual detection")
+        will_drive = str(_find_variable_definition(handler, "reset_will_drive"))
+        assert "reset_state != 'opn'" in will_drive
+        assert self._OPN_CLAUSE in will_drive
+        assert "helper_state_force == 'opn'" in will_drive
+
+    def test_the_displacer_owned_opn_restores_stay_ungated(self):
+        """The shading-end 'opn' restore is owned by the shading itself (the
+        automation that displaced the cover), not by the opening schedule —
+        gating it on is_opening_scheduled would strand shading-only setups at
+        the shading position. The #698 user-condition gate ('opening target
+        allowed') is an effect gate on top and does not change this."""
+        blueprint = _load_blueprint_yaml(BLUEPRINT_PATH)
+        handler = _find_branch_by_alias(
+            blueprint, "Shading end reconciliation: opening target allowed")
+        assert handler is not None, (
+            "shading-end reconciliation shape changed - re-audit Bug Pattern "
+            "BA's consumer classification before adapting this test"
+        )
+        move = _find_branch_by_alias(
+            blueprint, "Move cover after shading end - conditions still valid")
+        assert move is not None
+        will_drive = str(_find_variable_definition(move, "will_drive"))
+        assert "is_opening_scheduled" not in will_drive, (
+            "the shading-end restore must stay ownership-ungated "
+            "(displacer-owned, Bug Pattern BA)"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

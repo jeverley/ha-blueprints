@@ -129,7 +129,7 @@ Various different ventilation options.
   <br /><br />
 - <ins>Limit how far cover lowers when a contact sensor state is unreadable:</ins>
   <br />
-  For the <ins>tilted</ins> contact: an unknown reading resolves as tilted instead of the default "still closed" assumption, holding the cover at the ventilation floor, clearance for a window that may still be open, since a fully closed cover can knock items off a window sill in windy weather. Sun shading still applies down to that floor. Applies whichever the sensor's last known status was, without triggering the wait behavior above.
+  For the <ins>tilted</ins> contact: an unknown reading resolves as tilted instead of the default "still closed" assumption, holding the cover at the ventilation floor, clearance for a window that may still be open, since a fully closed cover can knock items off a window sill in windy weather. Sun shading still applies down to that floor. An unknown reading only limits lowering: a cover that already sits below the ventilation position (for example closed by hand) is not raised on a guess, only a confirmed tilt raises it. Applies whichever the sensor's last known status was, without triggering the wait behavior above.
   <br />
   For the <ins>opened</ins> contact: an unknown reading withholds a scheduled close, or the start/end of sun shading, instead of assuming "not open": it never drives the cover. Everything else it drives (the proactive full-open movement, the "hold and wait" behavior above) still requires a real reading.
   <br />

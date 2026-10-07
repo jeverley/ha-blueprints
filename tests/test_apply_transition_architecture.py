@@ -271,7 +271,7 @@ class TestForcePauseIsPartOfEveryDriveGate:
         assert gates is not None
         env = jinja2.Environment(undefined=jinja2.StrictUndefined)
         permissive = dict(
-            force_allows_ventilate=True, force_allows_open=True,
+            force_allows_ventilate=True, force_allows_open=True, vent_raise_hold=False,
             force_allows_shade=True, force_allows_close=True,
             effective_state="none_of_them",
             live_force="non",

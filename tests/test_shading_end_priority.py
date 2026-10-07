@@ -169,6 +169,8 @@ def _base_execution_vars(entity_states: dict) -> dict:
         },
         "current_position": 25,
         "ventilate_position": 50,
+        "position_tolerance": 3,
+        "in_ventilate_position": False,
         "current_tilt_position": 0,
         "ventilate_tilt_position": 60,
         "shading_end_conditions_met": True,
@@ -408,11 +410,13 @@ class TestShadingEndProspectiveCascade:
             )
         )
 
-        def verdict(state, allowed):
+        def verdict(state, allowed, up_allowed=True, down_allowed=True):
             variables = {
                 "shading_end_state": state,
                 "_input_verdicts": {
                     "auto_ventilate_condition": allowed,
+                    "auto_up_condition": up_allowed,
+                    "auto_down_condition": down_allowed,
                 },
             }
             alias = _first_matching_alias(_env(), gate_step["choose"], variables)
@@ -430,6 +434,18 @@ class TestShadingEndProspectiveCascade:
         assert verdict("vnt", True) is True
         assert verdict("lock", True) is True
         assert verdict("opn", False) is True
+        # #698: the open target honours the user's opening condition - a shading
+        # end must not perform an opening the condition currently refuses. The
+        # other targets are not the opening condition's business.
+        assert verdict("opn", True, up_allowed=False) is False
+        assert verdict("opn", False, up_allowed=True) is True
+        for target in ("cls", "shd"):
+            assert verdict(target, False, up_allowed=False) is True
+        # #698 mirror: the close target honours the closing condition
+        assert verdict("cls", True, down_allowed=False) is False
+        assert verdict("cls", False, down_allowed=True) is True
+        for target in ("opn", "shd"):
+            assert verdict(target, True, down_allowed=False) is True
 
     def test_non_open_shading_end_leaves_preserve_schedule_base_and_open_stamp(self):
         blueprint = _load_blueprint_yaml()
@@ -495,6 +511,30 @@ class TestShadingEndProspectiveCascade:
         alias = _first_matching_alias(_env(entity_states), choose, variables)
         assert alias == "Ventilation after shading ends"
 
+    def test_issue_667_tilt_cover_near_ventilate_position_selects_ventilation(self, choose):
+        # Same venetian setup as #608, but the motor reports the resting
+        # position a point off the commanded one (#538: tilt movement shifts
+        # the reported position). Within position_tolerance and with the
+        # slats off the ventilate angle, the ventilation branch must still
+        # win — the exact-equality alternative alone left the event to the
+        # reconciliation branch (contact handler: swallowed it entirely).
+        entity_states = {
+            "binary_sensor.window_opened": "off",
+            "binary_sensor.window_tilted": "on",
+        }
+        variables = _base_execution_vars(entity_states)
+        variables["position_comparisons"] = {
+            "current_below_ventilate": False,
+            "current_above_ventilate": True,  # raw comparison: 1 > 0
+        }
+        variables["current_position"] = 1
+        variables["ventilate_position"] = 0
+        variables["position_tolerance"] = 3
+        variables["in_ventilate_position"] = False  # slats off the vent angle
+        variables["current_tilt_position"] = 30
+        variables["ventilate_tilt_position"] = 70
+        alias = _first_matching_alias(_env(entity_states), choose, variables)
+        assert alias == "Ventilation after shading ends"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Bug fix: shading_end_state's 'lock' target was the only lockout-target

@@ -1,4 +1,4 @@
-# CCA Known Bug Patterns (A–AU, with cause and fix)
+# CCA Known Bug Patterns (A–BB, with cause and fix)
 
 The regression catalog. Most patterns are pinned by tests, but the *rules*
 derived from them apply to new code. Read the matching pattern before changing
@@ -482,7 +482,7 @@ The interval `(flip_from, flip_to + 60]` — previous on/off flip to current fli
 
 **Fix:** New branch "Shading start - hold ventilation floor (window tilted)" placed **before** "Start Shading" in the execution `choose`. It fires when the window is tilted (and not opened — Invariant 5), ventilation is enabled and force/resident-allowed, shading is resident-allowed, and `position_comparisons.shading_below_ventilate` holds. It drives to `ventilate_position` / `ventilate_tilt_position`, sets `shd: 1`, `win: 'tlt'`, clears pending (`pnd: 'non'`, `ts.due: 0`, `ts.arm: 0`), and sets `man: 0` only when it actually drives (`not in_ventilate_position`, Invariant 7). When the window later closes, the contact handler's "Window closed - Return to shading" lowers the cover to the real shading position.
 
-**Scope:** Only the common case `shading_position` below `ventilate_position` is floored (`position_comparisons.shading_below_ventilate`). When `shading_position` is at/above `ventilate_position` the floor does not bind and "Start Shading" drives to the shading position as before. The `lockout_tilted_shading_start` option still takes precedence (treats a tilted window like a fully-open one → cover stays open during shading). The latent `effective_state == 'vnt'` divergence for the rare `shading_position` *above* `ventilate_position` config is intentionally left untouched (out of scope, not the reported case).
+**Scope:** Only the common case `shading_position` below `ventilate_position` is floored (`position_comparisons.shading_below_ventilate`). When `shading_position` is at/above `ventilate_position` the floor does not bind and "Start Shading" drives to the shading position as before — on tilt covers with the **slat angle** floored at `ventilate_tilt_position` since #719 (Bug Pattern BB: `shading_tilt_target`). The `lockout_tilted_shading_start` option still takes precedence (treats a tilted window like a fully-open one → cover stays open during shading). The latent `effective_state == 'vnt'` divergence for the rare `shading_position` *above* `ventilate_position` config is intentionally left untouched (out of scope, not the reported case).
 
 ---
 
@@ -1197,5 +1197,130 @@ gate — auditing only the sites the original issue mentioned leaves the mirror 
 recur one by one. When adding such a gate, list every consumer of the target value and
 classify each as schedule-owned (gate) or displacer-owned (leave). Tests:
 `TestOpeningOwnershipGates` in `tests/test_blueprint_logic.py`.
+
+**Follow-up (BB, #713):** the recovery reducer itself was the fourth consumer — its
+ownership gates covered the flip and the reset, not the plain re-position to an unchanged
+`bas == 'opn'`. `opening_ownership_hold` now guards every recovery drive.
+
+---
+
+### Bug Pattern BB: A condition-only shading sensor's nightly `unavailable → off` runs an outage catch-up every sunrise (Issue #713)
+
+**Symptom:** A 🧩 Custom Condition Sensor built on PV production is `unavailable` all
+night and reports `off` once production starts. Every morning, ~30 s after that change,
+the covers that are still closed from the evening open — no sun shading was active, and
+the configured end waiting time plays no part. Several instances sharing the sensor move
+at once. (No trace was available; the report gave the sensor, the timing and the
+movement.)
+
+**Cause (two halves):**
+
+1. The custom condition sensor carried a `t_recovery` trigger like the other condition-only
+   sources ("every entity CCA reads gets one"). But it is a *pure shading-condition* source:
+   it never blocks a run, so nothing was swallowed while it was unavailable — and both of
+   its own triggers (`t_shading_start_pending_8`, `t_shading_end_pending_8`) carry the
+   `not in invalid_states` guard, so the return edge itself re-evaluates the shading (the
+   end edge after `for: shading_waitingtime_end`, #696, and behind the global `shd == 1`
+   gate). The recovery run that started 30 s later added only what it always adds:
+   `recovered_base` from the schedule, the flip gates, a drive to `recovered_state`. The
+   sibling shading sensors (shading brightness, temperature 1/2, forecast-temperature
+   sensor) never had the trigger. A sensor that is `unavailable` *by design* every night
+   turns "an outage ended" into a daily event — so every live/recovery deviation (the `for:`
+   windows, an opening condition that flipped since the opening time, R1–R5) and every
+   ownerless target in the helper surfaces every morning, on every instance sharing it.
+2. The movement itself was the #553/#695 class through a door #695 did not list: the
+   recovery reducer's own plain re-position. `caught_up_opening_hold` is scoped to a *flip*
+   (`caught_up_opening and not is_up_enabled`), `manual_reset_recovery_hold` to a *reset*; a
+   `t_recovery` reaching an instance with `bas == 'opn'` — the init default of a shading-only
+   instance, or the #673 state-only sync after the opening time with Morning Opening
+   unchecked (the "opens by hand" setup) — and a cover still closed computed
+   `recovered_state == 'opn'` and drove it to the open position.
+   `closing_ownership_hold` had covered exactly this on the closing side since the #673
+   mirror; `test_only_a_caught_up_opening_is_gated` even pinned the re-position as "today's
+   semantics" before BA stated the rule.
+
+**Fix:** (1) No `t_recovery` for the custom condition sensor — the comment in the trigger
+list names the class, recovery.md the reason. Its return now does what every other change
+of the sensor does: `on` fires the start evaluation, `off` runs the end waiting time, and
+nothing else. (2) `opening_ownership_hold` = `recovered_state == 'opn' and not
+is_opening_scheduled and live_force == 'non'` in the shared `recovery_apply` body, consumed
+by `will_drive` and named in `log_extra` — the mirror of `closing_ownership_hold` for every
+recovery drive (flip, re-position, opted-in reset). State progress is untouched: `bas` is
+still written, only the movement is withheld (Invariant 15); a live force-open and the
+overlay targets (`lock`/`vnt`/`shd`/`cls`) keep their own authority.
+
+**Rule:** (1) A `t_recovery` trigger needs a *reason*: the source can block a run (gate
+source), or its outage can strand an event no own trigger replays (calendar, resident,
+workday, the forecast weather end `_4`), or its state is persisted and would otherwise go
+stale (force entities). A sensor whose own triggers already fire on `unavailable → valid`
+gets none — and a condition-only input that users point at arbitrary entities must be
+assumed to be `unavailable` for hours *by design*. (2) BA's rule, third recurrence: list
+EVERY drive consumer of a value that can exist without its owning automation — "the
+recovery reducer has ownership gates" was true for two of its three `'opn'` drive paths.
+
+Tests: `TestRecoveryTriggers::test_a_pure_shading_condition_sensor_has_no_recovery_trigger`,
+`TestRecoveryTriggers::test_the_custom_sensor_re_evaluates_on_its_own_return_edge`,
+`TestOpeningOwnershipHold` (`tests/test_restart_recovery.py`),
+`TestIssue713OwnerlessOpenReposition` (`tests/test_recovery_live_parity.py`),
+`TestOpeningOwnershipGates::test_the_recovery_gate_gates_the_unowned_opn`
+(`tests/test_blueprint_logic.py`).
+
+---
+
+### Bug Pattern BB: The ventilation floor binds by depth only — venetian setups shade below the ventilation angle while the window is tilted (Issue #719)
+
+**Symptom:** Venetian blind: open 100, closed/shading/ventilation all at cover position
+0, told apart by the slat angle only (ventilate tilt 30, shading stages 0/16/24/33 —
+the setup the `tilt_position_tolerance` description documents). Window tilted, sun
+shading starts at stage 2: the slats go to 24, below the ventilation angle, although the
+window is tilted. Same at a stage change: shading started at stage 3 (33), the sun sinks
+to stage 2 — the floor would allow 30, the slats either stayed at 33 or (pre-#397) went to
+24. The reporter's rule: *while the window is tilted, the ventilation angle is the minimum
+for the shading angle; when the window closes, the real shading angle returns.*
+
+**Cause:** Bug Pattern AE implemented "VENT is a floor" by cover **depth** only —
+`position_comparisons.shading_below_ventilate`. When shading and ventilation share a cover
+position the depth floor is `false` by construction, "Start Shading" fired (tilt cover at
+or above the shading depth) and applied `shading_tilt_position` verbatim. Branch 3 (the
+tilt-stage re-drive) was blocked while tilted (#397) — correct against going *below* the
+angle, but it could not bring slats parked *above* the floor down *to* it either.
+
+**Fix:** One action-scope projection, consumed at exactly the two sites that apply the
+shading angle while VENT is in charge:
+
+```yaml
+vent_tilt_floor_binds: is_ventilation_enabled and not shading_over_ventilation and
+                       window_tilted_now and not window_opened_now and
+                       force_allows_ventilate and resident_flags.allow_ventilate and
+                       is_cover_tilt_enabled_and_possible and
+                       shading_tilt_position < ventilate_tilt_position
+shading_tilt_target:   ventilate_tilt_position if vent_tilt_floor_binds else shading_tilt_position
+```
+
+- "Start Shading" drives `target_tilt: shading_tilt_target` — tilted first, then shading
+  starts: slats stop at the ventilation angle, `shd: 1` as before.
+- Branch 3's tilted-window block gains the alternative `or vent_tilt_floor_binds`, with
+  `target_tilt: shading_tilt_target`: while tilted the stage re-drive may move the slats
+  **to** the floor (33 → 30 when the stage drops to 24), never away from it. A stage at or
+  above the floor stays frozen while tilted, exactly as before (#397) — driving to 33 while
+  `effective_state == 'vnt'` would widen the documented AE divergence (the cascade's vnt
+  target carries the ventilation angle; `in_ventilate_position` is exact, #615).
+- `state_targets.shd` keeps the raw stage angle, so the window-closed return
+  (`return_target == 'shd'`) restores the real shading angle; `in_shading_position` is
+  unchanged (the held cover reads as `vnt`, consistent with the cascade).
+
+**Unchanged by design:** `shading_over_ventilation` keeps letting the shading angle win
+(the floor flag carries `not shading_over_ventilation`, like the AE branch); a fully open
+window is LOCKOUT (Invariant 5); the AE depth floor still handles a shading depth below the
+ventilation depth; branch 3b (alternate depth) stays blocked while tilted; the contact
+handler's tilt event still moves a shaded cover to the ventilation angle (that *is* the
+ventilation position the user configured — the AE semantics "floor, not target" apply to
+the shading angle, not to the ventilation event).
+
+**Rule:** "VENT is a floor" has two axes on tilt covers — depth **and** slat angle. A
+floor check that compares positions only is dead on every setup whose states differ by
+angle alone (the venetian case the tilt-tolerance input exists for). When adding a
+position-relation gate, ask what the same relation means on the tilt axis. Tests:
+`tests/test_vent_tilt_floor.py`.
 
 ---

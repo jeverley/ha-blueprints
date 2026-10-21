@@ -110,7 +110,7 @@ Consumed at 5 sites: `effective_state`'s `w`, `recovered_window`, `window_tilted
 
 **Tilted rationale:** VENT is safe under both truths: a still-closed window loses a bit of shading, an actually-open one is exactly where it should be.
 
-**Unconfirmed tilt never raises (`vent_raise_hold`):** VENT is only "safe under both truths" for *lowering*. Raising a cover that sits below the ventilation position on an unreadable reading overrides a deliberate lower position (e.g. someone closed the blind by hand and knows the window is shut) on a guess. `vent_raise_hold` (unconfirmed tilt, toggle on, cover below vent, no live Force) is therefore a drive gate on every `vnt` target: `state_gates.vnt` (resident hold, closing floor), recovery, shading start/end, force-pause resume, force-disable return, manual reset. It never touches state (`win`/`res`/`bas` still advance, invariant 15), `lock`, or a live Force. A confirmed tilt still raises to the floor. Resident arrival/departure bypassing Manual Override is documented upstream as intentional and is not changed by this.
+**Unconfirmed tilt never raises (`vent_raise_hold`):** VENT is only "safe under both truths" for *lowering*. Raising a cover that sits below the ventilation position on an unreadable reading overrides a deliberate lower position (e.g. someone closed the blind by hand and knows the window is shut) on a guess. `vent_raise_hold` (unconfirmed tilt, toggle on, cover below vent by depth or, on tilt covers at/below vent depth, by slat angle more closed than the ventilation angle, no live Force) is therefore a drive gate on every `vnt` target: `state_gates.vnt` (resident hold, closing floor), recovery, shading start/end, force-pause resume, force-disable return, manual reset, plus the shading slat-angle re-check (with #719 `vent_tilt_floor_binds`). It never touches state (`win`/`res`/`bas` still advance, invariant 15), `lock`, or a live Force. A confirmed tilt still raises to the floor. Resident arrival/departure bypassing Manual Override is documented upstream as intentional and is not changed by this.
 
 **Opened contact gets a narrower extension**, combined inline at its exactly two consumers (`lockout_now.*` and `shading_end_state`'s `'lock'` branch) as `window_opened_now or (limit_lowering_on_unknown_contact_state and opened_invalid)`. Deliberately not factored into a shared `window_opened_now_or_unknown` name: unlike `window_tilted_now` (10 pre-existing consumers all wanting the identical widened value), these two consumers are both new code, and every prior bug in this feature was the same shape, the toggle's effect decided once upstream, invisible at the consumer that actually needed to know. Combining the raw fact (`opened_invalid`) with the toggle right at each decision point keeps that visible. Only the *passive* half (withhold a close/shading) is safe to widen this way, since a wrongly-assumed-open window driving the cover further open is not safe. The *proactive* half (`window_opened_now` itself, and every other consumer: contact handler's own drive, LOCKOUT's `s_opn`, resident target chains, `recovery_target`) stays confirmed-only. Do not extend `window_opened_now` beyond the two named consumers.
 
@@ -318,7 +318,10 @@ structural safety net rather than removed in the same change.
 drive to `'opn'` when `not is_opening_scheduled and live_force == 'non'` — the Issue #553
 resting-state class (a schedule-less instance's permanent `bas` init default, which requires no
 write at all: `bas` starts at `'opn'`). `manual_reset_recovery_hold` checks this unconditionally
-inside the opt-in branch; it is not itself a separate setting. The `live_force == 'non'` term
+inside the opt-in branch; it is not itself a separate setting. Since CCA 2026.10.12 V2 (#713, Bug
+Pattern BB) `opening_ownership_hold` applies the same rule to *every* recovery drive — flip,
+plain re-position and opted-in reset alike, the exact mirror of `closing_ownership_hold` — so the
+reset clause is now one instance of the general rule and stays for its own log line. The `live_force == 'non'` term
 (CCA 2026.08.23 review finding) matters because `recovered_state` mirrors `live_force` first
 (architecture.md): an `'opn'` produced by an active Force-Open target has a live owner and is
 not the ownerless #553 default, so the guard must not hold it back — without this term, an
@@ -422,7 +425,7 @@ sun-position end or the closing time resolve the rest. Also new: a sensor report
 
 Pinned by `tests/test_shading_end_wait_in_trigger.py`.
 
-### The brightness shading-start trigger holds the waiting time via `for:` too — only that one (#696 follow-up, CCA 2026.10.04)
+### The brightness shading-start trigger holds the waiting time via `for:` too — only that one (#696 follow-up, CCA 2026.10.12 V2)
 
 **Decision.** `t_shading_start_pending_2` carries `for: seconds: !input shading_waitingtime_start`; the
 arm branch ("Shading detected") sets `shading_start_wait = 0` for that trigger so `shading_start_due`

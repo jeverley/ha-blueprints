@@ -645,16 +645,47 @@ class TestClosingVentFloorReachesUnconfirmedTiltEvenWithLockoutEnabled:
 
 class TestUnconfirmedTiltNeverRaises:
     def _hold(self, *, toggle=True, vent_enabled=True, tilted_invalid=True,
-              confirmed=False, below=True, live_force="non"):
+              confirmed=False, below=True, above=False, live_force="non",
+              tilt_capable=False, tilt=50, vent_tilt=50, tilt_tol=3):
         return _render_bool(
             _action_var("vent_raise_hold"), {},
             limit_lowering_on_unknown_contact_state=toggle,
             is_ventilation_enabled=vent_enabled,
             tilted_invalid=tilted_invalid,
             window_tilted_confirmed=confirmed,
-            position_comparisons={"current_below_ventilate": below},
+            position_comparisons={"current_below_ventilate": below,
+                                  "current_above_ventilate": above},
             live_force=live_force,
+            is_cover_tilt_enabled_and_possible=tilt_capable,
+            current_tilt_position=tilt,
+            ventilate_tilt_position=vent_tilt,
+            tilt_position_tolerance=tilt_tol,
         )
+
+    # Venetian: closed/shading/ventilation share one depth, only the slat angle differs.
+    def test_slats_more_closed_than_vent_angle_hold_at_same_depth(self):
+        assert self._hold(below=False, tilt_capable=True, tilt=24, vent_tilt=30) is True
+
+    def test_slats_within_tolerance_of_vent_angle_do_not_hold(self):
+        assert self._hold(below=False, tilt_capable=True, tilt=28, vent_tilt=30) is False
+
+    def test_slats_more_open_than_vent_angle_still_lower_to_it(self):
+        assert self._hold(below=False, tilt_capable=True, tilt=70, vent_tilt=30) is False
+
+    def test_cover_deeper_than_vent_with_closed_slats_is_not_held(self):
+        assert self._hold(below=False, above=True, tilt_capable=True, tilt=10, vent_tilt=30) is False
+
+    def test_non_tilt_cover_ignores_the_slat_angle(self):
+        assert self._hold(below=False, tilt_capable=False, tilt=0, vent_tilt=30) is False
+
+    def test_slat_angle_hold_needs_an_unconfirmed_tilt(self):
+        assert self._hold(below=False, tilt_capable=True, tilt=0, vent_tilt=30,
+                          confirmed=True, tilted_invalid=False) is False
+
+    def test_shading_tilt_recheck_is_guarded_by_the_hold(self):
+        branch = _find_branch_by_alias(BP["actions"], "Check for shading tilt")
+        will_drive = branch["sequence"][0]["variables"]["will_drive"]
+        assert "vent_tilt_floor_binds and not vent_raise_hold" in will_drive
 
     def test_unconfirmed_tilt_with_cover_below_vent_holds(self):
         assert self._hold() is True
